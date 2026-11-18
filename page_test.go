@@ -48,3 +48,22 @@ func TestPageEscapesUntrustedText(t *testing.T) {
 		t.Fatal("unescaped script in the page")
 	}
 }
+
+func TestUsageMetricsSeparateLabelFromValue(t *testing.T) {
+	// A CJK label glued to a monospace number reads as one token ("今日请求3"),
+	// so the label and the value are separate block elements.
+	configure([]byte("enabled: true\napi_key: \"\"\n"))
+	defer configure(nil)
+	resp, _ := pageHandler{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet})
+	body := string(resp.Body)
+	for _, label := range []string{"今日请求", "输入", "输出", "缓存命中", "推理", "合计"} {
+		pattern := `<span class="k">` + label + `</span><span class="num`
+		if !strings.Contains(body, pattern) {
+			t.Errorf("label %q is not its own element", label)
+		}
+	}
+	// And the label must never be inline with the number.
+	if strings.Contains(body, `<span class="k muted">今日请求</span><span class="num`) {
+		t.Fatal("the old inline label markup is back")
+	}
+}
