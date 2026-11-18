@@ -445,12 +445,23 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 		cred.BaseURL = firstNonEmpty(cred.BaseURL, body.BaseURL)
 		cred.APIBase = firstNonEmpty(cred.APIBase, body.APIBase)
 	}
-	if cred.PlanKey == "" {
-		cred.PlanKey = strings.TrimPrefix(strings.TrimSpace(header("Authorization")), "Bearer ")
+	// Note: `Authorization` on a management route is CPA's management key — it
+	// must never be used as a Mistral key. Only X-Vibe-Plan-Key / plan_key, the
+	// JSON body, and the configured key are.
+	// Nothing supplied: use what config.yaml already gave the plugin, so the
+	// page opens onto the balance of the configured key with no input at all.
+	if cred.Empty() {
+		cfg := currentConfig()
+		cred.PlanKey = cfg.apiKey
+		cred.APIKey = cfg.apiKey
+		// base_url is where inference happens; the plan lives on the console.
+		// Setting BaseURL from base_url sent the whoami read to api.mistral.ai.
+		cred.APIBase = firstNonEmpty(cred.APIBase, cfg.baseUrl())
+		cred.BaseURL = firstNonEmpty(cred.BaseURL, cfg.planBaseOrDefault())
 	}
 	if cred.Empty() {
 		return jsonRoute(http.StatusBadRequest, map[string]any{
-			"error": "provide plan_key in the JSON body, an X-Vibe-Plan-Key header, or ?plan_key=",
+			"error": "no Mistral key: set api_key under plugins.configs." + pluginID + " in config.yaml, or pass plan_key",
 		})
 	}
 	// The render route reads through the same path as quota.fetch so the month
@@ -461,6 +472,8 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 	// connect: publish the key into CPA's own AI-provider list, then let CPA
 	// serve the traffic natively. The plan is a bonus, not a prerequisite.
 	if strings.HasSuffix(req.Path, "/connect") {
+		// CPA already authenticated this request with its own management key;
+		// forwarding it is only needed to reach CPA's management API in turn.
 		managementKey := firstNonEmpty(header("X-Management-Key"), strings.TrimPrefix(header("Authorization"), "Bearer "), query("management_key"))
 		var requested struct {
 			ManagementBase string `json:"management_base"`

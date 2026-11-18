@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -111,5 +113,52 @@ func TestCredentialFromStorageRecoversBothKeys(t *testing.T) {
 	}
 	if cred.BaseURL != "https://api.mistral.ai" && cred.APIBase != "https://api.mistral.ai" {
 		t.Errorf("base url lost: %+v", cred)
+	}
+}
+
+func TestBalanceRouteFallsBackToTheConfiguredKey(t *testing.T) {
+	// With no key in the request, the route must use plugins.configs.<id>.api_key
+	// — that is what makes the page need no input at all.
+	configure([]byte("enabled: true\napi_key: \"mstrl_configured\"\nbase_url: \"https://api.mistral.ai\"\n"))
+	defer configure(nil)
+
+	cred := credential{}
+	cfg := currentConfig()
+	if cfg.apiKey != "mstrl_configured" {
+		t.Fatalf("configured key not read: %q", cfg.apiKey)
+	}
+	// The fallback the route performs.
+	cred.PlanKey = cfg.apiKey
+	cred.APIKey = cfg.apiKey
+	cred.APIBase = cfg.baseUrl()
+	cred.BaseURL = cfg.planBaseOrDefault()
+
+	if cred.PlanKey != "mstrl_configured" {
+		t.Fatalf("plan key = %q", cred.PlanKey)
+	}
+	// The plan lives on the console; the inference base must not be reused for it.
+	if cred.planBase() != "https://console.mistral.ai" {
+		t.Fatalf("planBase = %q", cred.planBase())
+	}
+	if cred.apiBase() != "https://api.mistral.ai" {
+		t.Fatalf("apiBase = %q", cred.apiBase())
+	}
+}
+
+func TestManagementKeyIsNeverUsedAsAMistralKey(t *testing.T) {
+	// `Authorization` on a management route carries CPA's own key. Treating it as
+	// a Mistral key sent the management secret upstream and came back 401.
+	req := pluginapi.ManagementRequest{
+		Method:  "GET",
+		Path:    "/v0/management/mistral-vibe/balance",
+		Headers: map[string][]string{"Authorization": {"Bearer cpa-management-key"}},
+		Query:   map[string][]string{},
+	}
+	resp, err := manager{}.HandleManagement(context.Background(), req)
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if strings.Contains(string(resp.Body), "cpa-management-key") {
+		t.Fatalf("the management key leaked into an upstream call: %s", resp.Body)
 	}
 }

@@ -137,3 +137,13 @@ func envOr(key, fallback string) string {
 func jsonUnmarshalOK(raw []byte, target any) bool {
 	return json.Unmarshal(raw, target) == nil
 }
+
+// baseUrl is the Mistral base the operator configured, or the default.
+func (c pluginConfig) baseUrl() string {
+	return firstNonEmpty(c.baseURL, defaultAPIBase)
+}
+
+// planBase is the console host the plan is read from.
+func (c pluginConfig) planBaseOrDefault() string {
+	return firstNonEmpty(c.planBase, defaultPlanBase)
+}

@@ -56,26 +56,7 @@
 <div class="wrap">
   <div>
     <h1>Mistral Vibe · Token Plan</h1>
-    <p class="sub">连接后 Mistral 会以 OpenAI 兼容条目的形式出现在「AI 提供商」里，调用由 CPA 原生转发。</p>
-  </div>
-
-  <div class="card" id="connect">
-    <div class="grid2">
-      <div>
-        <label for="planKey">API Key</label>
-        <input id="planKey" type="password" placeholder="粘贴你的 Mistral API Key" autocomplete="off" spellcheck="false">
-      </div>
-      <div>
-        <label for="baseUrl">Base URL</label>
-        <input id="baseUrl" style="width:100%" value="https://api.mistral.ai" spellcheck="false">
-      </div>
-    </div>
-    <div class="row" style="margin-top:12px">
-      <button id="connectBtn">添加到 AI 提供商</button>
-      <button class="ghost" id="balanceBtn">查余额</button>
-      <span id="status" class="sub"></span>
-    </div>
-    <div id="result" class="stat" style="display:none;margin-top:12px"></div>
+    <p class="sub">余额读自你在 <code>plugins.configs.cpa-mistral-vibe</code> 里配置的 key，不需要在这里再填一次。</p>
   </div>
 
   <div class="card" id="balanceCard">
@@ -89,30 +70,66 @@
       <div class="bar" id="usageBar"><i style="width:0%"></i></div>
       <div id="windows" class="sub" style="margin-top:8px"></div>
     </div>
-    <details>
-      <summary>这个条目长什么样</summary>
-      <pre id="entryPreview" class="sub" style="white-space:pre-wrap"></pre>
+    <div class="row" style="margin-top:12px">
+      <button class="ghost" id="refreshBtn">刷新</button>
+      <span id="status" class="sub"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <details id="connectBox">
+      <summary>换一个 key，或手动添加到 AI 提供商</summary>
+      <p class="sub" style="margin-top:10px">
+        配置里的 key 会在 CPA 启动时自动写入 AI 提供商。只有想临时用别的 key 时才需要这里；
+        写进 AI 提供商需要 CPA 的管理密钥。
+      </p>
+      <div class="grid2" style="margin-top:10px">
+        <div>
+          <label for="planKey">API Key</label>
+          <input id="planKey" type="password" placeholder="留空则使用配置里的 key" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="baseUrl">Base URL</label>
+          <input id="baseUrl" value="https://api.mistral.ai" spellcheck="false">
+        </div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <input id="mgmtKey" type="password" placeholder="CPA 管理密钥（仅写入时需要）" autocomplete="off" spellcheck="false" style="flex:1;min-width:220px">
+        <button id="connectBtn">添加到 AI 提供商</button>
+      </div>
+      <div id="result" class="stat" style="display:none;margin-top:12px"></div>
     </details>
   </div>
 </div>
 
 <script>
-const MANAGEMENT_KEY_HEADER = 'X-Management-Key';
-// The panel reuses its own session; the page reads the same storage keys the
-// CPA management center writes, and falls back to an input when absent.
-function managementKey() {
-  for (const store of [localStorage, sessionStorage]) {
-    for (const key of ['managementKey', 'cli-proxy-auth', 'cpamc.management_key']) {
-      const raw = store.getItem(key);
+const $ = (id) => document.getElementById(id);
+const setStatus = (text, kind) => {
+  $('status').textContent = text || '';
+  $('status').style.color = kind === 'bad' ? 'var(--bad)' : '';
+};
+
+// Same-origin: the plugin's management routes live next to the resource page.
+const apiBase = (() => {
+  const index = location.pathname.indexOf('/v0/resource/plugins/');
+  return index >= 0 ? location.pathname.slice(0, index) : '';
+})();
+const managementURL = (suffix) => apiBase + '/v0/management/mistral-vibe/' + suffix;
+
+// The panel keeps the management key when "remember password" is ticked. It is
+// only needed to write; balance reads don't use it.
+function rememberedKey() {
+  const stores = [];
+  try { stores.push(localStorage, sessionStorage); } catch (_) { return ''; }
+  for (const store of stores) {
+    for (const name of ['managementKey', 'cli-proxy-auth', 'cpamc.management_key']) {
+      const raw = store.getItem(name);
       if (!raw) continue;
       try {
         const parsed = JSON.parse(raw);
         if (typeof parsed === 'string' && parsed) return parsed;
-        if (parsed && typeof parsed === 'object') {
-          if (parsed.managementKey) return parsed.managementKey;
-          if (parsed.key) return parsed.key;
-          if (parsed.token) return parsed.token;
-        }
+        if (parsed && parsed.managementKey) return parsed.managementKey;
+        if (parsed && parsed.key) return parsed.key;
       } catch (_) {
         if (raw.trim()) return raw.trim();
       }
@@ -121,84 +138,13 @@ function managementKey() {
   return '';
 }
 
-const apiBase = (() => {
-  // Resource routes live under /v0/resource/plugins/<id>/; management lives at /v0/management.
-  const path = location.pathname;
-  const index = path.indexOf('/v0/resource/plugins/');
-  return index >= 0 ? path.slice(0, index) : '';
-})();
-
-function managementURL(suffix) {
-  return apiBase + '/v0/management/mistral-vibe/' + suffix;
-}
-
-function headers(withKey) {
-  const out = { 'Content-Type': 'application/json' };
-  if (withKey) {
-    out[MANAGEMENT_KEY_HEADER] = withKey;
-    out.Authorization = 'Bearer ' + withKey;
-  }
-  return out;
-}
-
-const $ = (id) => document.getElementById(id);
-const status = (text, kind) => { $('status').textContent = text; $('status').style.color = kind === 'bad' ? 'var(--bad)' : ''; };
-
-async function connect() {
-  const key = $('planKey').value.trim();
-  const base = $('baseUrl').value.trim() || 'https://api.mistral.ai';
-  if (!key) return status('先填 API Key', 'bad');
-  const mk = managementKey();
-  if (!mk) return status('需要在 CPA 管理面板里打开本页（找不到管理密钥）', 'bad');
-  $('connectBtn').disabled = true;
-  status('正在写入 AI 提供商…');
-  try {
-    const resp = await fetch(managementURL('connect'), {
-      method: 'POST',
-      headers: headers(mk),
-      body: JSON.stringify({ plan_key: key, api_key: key, base_url: base }),
-    });
-    const data = await resp.json();
-    const box = $('result');
-    box.style.display = 'block';
-    if (!resp.ok) {
-      box.className = 'stat bad';
-      box.textContent = data.error || ('失败：HTTP ' + resp.status);
-      status('');
-      return;
-    }
-    const p = data.provider;
-    box.className = 'stat ok';
-    box.innerHTML = (p.created ? '已添加' : '已更新') + '「' + p.name + '」，Base URL <code>' +
-      p.base_url + '</code>，模型 ' + p.models.map(m => '<code>' + m + '</code>').join(' ') +
-      '。刷新「AI 提供商」页即可看到。';
-    status('');
-    $('entryPreview').textContent = JSON.stringify({
-      name: p.name,
-      'base-url': p.base_url,
-      'api-key-entries': [{ 'api-key': '••••' + key.slice(-4) }],
-      models: p.models.map((m) => ({ name: m, alias: m })),
-    }, null, 2);
-  } catch (err) {
-    status('请求失败：' + err.message, 'bad');
-  } finally {
-    $('connectBtn').disabled = false;
-  }
-}
-
 async function loadBalance() {
-  const key = $('planKey').value.trim();
-  if (!key) return status('先填 API Key', 'bad');
-  const mk = managementKey();
-  if (!mk) return status('需要在 CPA 管理面板里打开本页', 'bad');
-  status('读取中…');
+  setStatus('读取中…');
   try {
-    const url = managementURL('balance') + '?plan_key=' + encodeURIComponent(key) +
-      '&base_url=' + encodeURIComponent($('baseUrl').value.trim() || 'https://api.mistral.ai');
-    const resp = await fetch(url, { headers: headers(mk) });
+    const resp = await fetch(managementURL('balance'));
     const data = await resp.json();
-    if (!resp.ok) return status(data.error || ('失败：HTTP ' + resp.status), 'bad');
-    status('');
+    if (!resp.ok) return setStatus(data.error || ('读取失败：HTTP ' + resp.status), 'bad');
+    setStatus('');
     $('planName').textContent = data.plan || '—';
     if (typeof data.balance === 'number') {
       $('remain').textContent = data.balance.toFixed(2) + ' ' + (data.currency || '');
@@ -214,12 +160,47 @@ async function loadBalance() {
     $('windows').textContent = (data.windows || [])
       .map((w) => w.window + ' · 剩余 ' + Math.round(w.remaining * 100) + '%').join('　');
   } catch (err) {
-    status('请求失败：' + err.message, 'bad');
+    setStatus('读取失败：' + err.message, 'bad');
   }
 }
 
+async function connect() {
+  const key = $('planKey').value.trim();
+  const base = $('baseUrl').value.trim() || 'https://api.mistral.ai';
+  const mgmt = $('mgmtKey').value.trim() || rememberedKey();
+  if (!key) return setStatus('这里留空时用的是配置里的 key；要换 key 请先填', 'bad');
+  if (!mgmt) return setStatus('写入 AI 提供商需要 CPA 管理密钥，请填上面的输入框', 'bad');
+  $('connectBtn').disabled = true;
+  setStatus('正在写入 AI 提供商…');
+  try {
+    const resp = await fetch(managementURL('connect'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Management-Key': mgmt, Authorization: 'Bearer ' + mgmt },
+      body: JSON.stringify({ plan_key: key, api_key: key, base_url: base }),
+    });
+    const data = await resp.json();
+    const box = $('result');
+    box.style.display = 'block';
+    if (!resp.ok) {
+      box.className = 'stat bad';
+      box.textContent = data.error || ('失败：HTTP ' + resp.status);
+      return setStatus('');
+    }
+    const p = data.provider;
+    box.className = 'stat ok';
+    box.innerHTML = (p.created ? '已添加' : '已更新') + '「' + p.name + '」，Base URL <code>' +
+      p.base_url + '</code>，' + p.models.length + ' 个模型。刷新「AI 提供商」页即可看到。';
+    setStatus('');
+  } catch (err) {
+    setStatus('请求失败：' + err.message, 'bad');
+  } finally {
+    $('connectBtn').disabled = false;
+  }
+}
+
+$('refreshBtn').addEventListener('click', loadBalance);
 $('connectBtn').addEventListener('click', connect);
-$('balanceBtn').addEventListener('click', loadBalance);
+loadBalance();
 </script>
 </body>
 </html>
