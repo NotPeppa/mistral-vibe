@@ -223,3 +223,22 @@ func TestManagementPathStaysJSON(t *testing.T) {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, resp.Body)
 	}
 }
+
+func TestSchemaVersionIsOldEnoughForShippedCPA(t *testing.T) {
+	// CPA rejects a plugin newer than itself:
+	//   "plugin.register failed: plugin schema version 10 is not supported"
+	// 8.0.4 tops out at 6, so the plugin must not claim more.
+	if schemaVersion > 6 {
+		t.Fatalf("schema version %d breaks CPA 8.0.4, which supports up to 6", schemaVersion)
+	}
+	// And the descriptor must report exactly what we declared.
+	var reg struct {
+		SchemaVersion uint32 `json:"schema_version"`
+	}
+	if err := json.Unmarshal(pluginDescriptor(), &reg); err != nil {
+		t.Fatal(err)
+	}
+	if reg.SchemaVersion != schemaVersion {
+		t.Fatalf("descriptor says %d, package says %d", reg.SchemaVersion, schemaVersion)
+	}
+}

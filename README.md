@@ -21,6 +21,17 @@
 
 ## 安装
 
+### 0. 版本要求
+
+插件声明的 plugin schema 是 **6**。CPA 会拒绝比自己新的插件：
+
+```
+plugin.register failed: plugin schema version 10 is not supported
+```
+
+所以在 CPA **8.0.4**（schema 6）及以上可用；更老的 CPA 需要改低
+`schemaVersion` 重新编译。
+
 ### 1. 拿到文件
 
 从 [Releases](https://github.com/NotPeppa/mistral-vibe/releases) 下载：

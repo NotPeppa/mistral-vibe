@@ -115,7 +115,9 @@ func run(h *handle) bool {
 	check("declares auth_provider", desc.Capabilities["auth_provider"], string(reg))
 	check("declares quota_provider", desc.Capabilities["quota_provider"], string(reg))
 	check("declares management_api", desc.Capabilities["management_api"], string(reg))
-	check("negotiates schema 10", desc.SchemaVersion == 10, fmt.Sprint(desc.SchemaVersion))
+	// 6 is the oldest schema that keeps raw management JSON un-escaped and the
+	// newest CPA 8.0.4 accepts; a newer claim is rejected outright.
+	check("negotiates schema 6", desc.SchemaVersion == 6, fmt.Sprint(desc.SchemaVersion))
 
 	fmt.Println("[2] auth.identifier / quota.identifier")
 	id, err := h.invoke("auth.identifier", []byte("{}"))

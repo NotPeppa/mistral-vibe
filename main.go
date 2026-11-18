@@ -55,13 +55,19 @@ import (
 var buildVersion = pluginVer
 
 const (
-	pluginName    = "Mistral Vibe Token Plan"
-	pluginVer     = "0.1.0"
-	pluginAuthor  = "NotPeppa"
-	pluginRepo    = "https://github.com/NotPeppa/mistral-vibe"
-	pluginID      = "mistral-vibe"
-	providerID    = "mistral-vibe"
-	schemaVersion = pluginabi.SchemaVersion
+	pluginName   = "Mistral Vibe Token Plan"
+	pluginVer    = "0.1.0"
+	pluginAuthor = "NotPeppa"
+	pluginRepo   = "https://github.com/NotPeppa/mistral-vibe"
+	pluginID     = "mistral-vibe"
+	providerID   = "mistral-vibe"
+	// The plugin only uses the always-present capability set, so it declares the
+	// oldest schema that still covers it rather than the SDK's latest. CPA
+	// rejects a plugin whose schema is newer than its own:
+	//   "plugin.register failed: plugin schema version 10 is not supported"
+	// CPA 8.0.4 tops out at 6, and 6 is also where raw management JSON bodies
+	// arrive un-escaped, which this plugin relies on.
+	schemaVersion = pluginabi.SchemaVersionRawManagementResponse
 
 	// console.mistral.ai is the host that actually answers; console.vibe.* only
 	// resolves through a different edge and refused the same request.
