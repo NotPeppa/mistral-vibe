@@ -28,7 +28,10 @@
   html, body { height: 100%; }
   body {
     margin: 0;
-    padding: 32px 28px 48px;
+    /* The Management Center floats its own controls over a plugin page's top-right
+       corner (refresh / language / theme / expand), so the header keeps clear of
+       it rather than sitting under it. */
+    padding: 64px 28px 48px;
     background: var(--bg);
     color: var(--text);
     font: 14px/1.55 "Fira Sans", -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
@@ -39,6 +42,9 @@
 
   /* ---------- header ---------- */
   header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+  /* Keep the panel's floating toolbar clear: no control of ours in that corner. */
+  header .actions { margin-right: 168px; }
+  @media (max-width: 900px) { header .actions { margin-right: 0; } }
   h1 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -.02em; }
   .sub { margin: 6px 0 0; color: var(--text-2); font-size: 13.5px; }
   .sub code { font-family: "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; color: var(--text); background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 6px; padding: 1px 6px; }
