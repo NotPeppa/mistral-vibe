@@ -300,8 +300,19 @@ func run(h *handle) bool {
 
 	fmt.Println("[11] plugin page")
 	pageReq, _ := json.Marshal(map[string]any{"method": "GET", "path": "/", "headers": map[string][]string{}, "query": map[string][]string{}})
-	_, err = h.invoke("management.handle", pageReq)
+	page, err := h.invoke("management.handle", pageReq)
 	check("page route answers", err == nil, errText(err))
+	// The page must arrive rendered: a resource route has no management auth, so
+	// it cannot fetch the balance itself.
+	pageBody := decodeBody(fieldOf(page, "Body"))
+	if pageBody == "" {
+		pageBody = string(page)
+	}
+	if len(pageBody) < 200 {
+		pageBody += strings.Repeat(" ", 200-len(pageBody))
+	}
+	check("page has no unrendered placeholder", !contains(pageBody, "{{"), pageBody[:200])
+	check("page shows the configured key source", contains(pageBody, "api_key"), pageBody[:200])
 
 	fmt.Println("[12] unknown method")
 	_, err = h.invoke("nope.nope", []byte("{}"))

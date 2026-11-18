@@ -56,23 +56,23 @@
 <div class="wrap">
   <div>
     <h1>Mistral Vibe · Token Plan</h1>
-    <p class="sub">余额读自你在 <code>plugins.configs.cpa-mistral-vibe</code> 里配置的 key，不需要在这里再填一次。</p>
+    <p class="sub">{{keyHint}}，不需要在这里再填一次。</p>
   </div>
 
   <div class="card" id="balanceCard">
     <div class="row" style="justify-content:space-between">
-      <div class="metric"><span class="v" id="planName">—</span><span class="k">计划</span></div>
-      <div class="metric"><span class="v" id="remain">—</span><span class="k">本月剩余</span></div>
-      <div class="metric"><span class="v" id="spent">—</span><span class="k">已用</span></div>
-      <div class="metric"><span class="v" id="resetAt">—</span><span class="k">重置时间</span></div>
+      <div class="metric"><span class="v">{{plan}}</span><span class="k">计划</span></div>
+      <div class="metric"><span class="v">{{remain}}</span><span class="k">本月剩余</span></div>
+      <div class="metric"><span class="v">{{spent}}</span><span class="k">已用</span></div>
+      <div class="metric"><span class="v">{{reset}}</span><span class="k">重置时间</span></div>
     </div>
     <div style="margin-top:14px">
-      <div class="bar" id="usageBar"><i style="width:0%"></i></div>
-      <div id="windows" class="sub" style="margin-top:8px"></div>
+      <div class="bar{{barTone}}" id="usageBar"><i style="width:{{barPct}}%"></i></div>
+      <div id="windows" class="sub" style="margin-top:8px">{{windows}}</div>
     </div>
+    {{note}}
     <div class="row" style="margin-top:12px">
-      <button class="ghost" id="refreshBtn">刷新</button>
-      <span id="status" class="sub"></span>
+      <button class="ghost" onclick="location.reload()">刷新</button>
     </div>
   </div>
 
@@ -103,77 +103,26 @@
 </div>
 
 <script>
+// Only the optional "replace the key" form needs script; the balance is rendered
+// server-side because a resource page has no management authentication.
 const $ = (id) => document.getElementById(id);
 const setStatus = (text, kind) => {
-  $('status').textContent = text || '';
-  $('status').style.color = kind === 'bad' ? 'var(--bad)' : '';
+  const el = $('status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = kind === 'bad' ? 'var(--bad)' : '';
 };
-
-// Same-origin: the plugin's management routes live next to the resource page.
-const apiBase = (() => {
-  const index = location.pathname.indexOf('/v0/resource/plugins/');
-  return index >= 0 ? location.pathname.slice(0, index) : '';
-})();
-const managementURL = (suffix) => apiBase + '/v0/management/mistral-vibe/' + suffix;
-
-// The panel keeps the management key when "remember password" is ticked. It is
-// only needed to write; balance reads don't use it.
-function rememberedKey() {
-  const stores = [];
-  try { stores.push(localStorage, sessionStorage); } catch (_) { return ''; }
-  for (const store of stores) {
-    for (const name of ['managementKey', 'cli-proxy-auth', 'cpamc.management_key']) {
-      const raw = store.getItem(name);
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(raw);
-        if (typeof parsed === 'string' && parsed) return parsed;
-        if (parsed && parsed.managementKey) return parsed.managementKey;
-        if (parsed && parsed.key) return parsed.key;
-      } catch (_) {
-        if (raw.trim()) return raw.trim();
-      }
-    }
-  }
-  return '';
-}
-
-async function loadBalance() {
-  setStatus('读取中…');
-  try {
-    const resp = await fetch(managementURL('balance'));
-    const data = await resp.json();
-    if (!resp.ok) return setStatus(data.error || ('读取失败：HTTP ' + resp.status), 'bad');
-    setStatus('');
-    $('planName').textContent = data.plan || '—';
-    if (typeof data.balance === 'number') {
-      $('remain').textContent = data.balance.toFixed(2) + ' ' + (data.currency || '');
-      $('spent').textContent = (data.spent || 0).toFixed(2) + (data.limit ? ' / ' + data.limit : '');
-      const pct = data.limit ? Math.min(100, (data.spent / data.limit) * 100) : 0;
-      const bar = $('usageBar');
-      bar.className = 'bar' + (pct >= 90 ? ' bad' : pct >= 75 ? ' warn' : '');
-      bar.querySelector('i').style.width = pct.toFixed(1) + '%';
-    } else {
-      $('remain').textContent = '未上报';
-    }
-    $('resetAt').textContent = data.reset_at ? data.reset_at.slice(0, 10) : '—';
-    $('windows').textContent = (data.windows || [])
-      .map((w) => w.window + ' · 剩余 ' + Math.round(w.remaining * 100) + '%').join('　');
-  } catch (err) {
-    setStatus('读取失败：' + err.message, 'bad');
-  }
-}
 
 async function connect() {
   const key = $('planKey').value.trim();
   const base = $('baseUrl').value.trim() || 'https://api.mistral.ai';
-  const mgmt = $('mgmtKey').value.trim() || rememberedKey();
-  if (!key) return setStatus('这里留空时用的是配置里的 key；要换 key 请先填', 'bad');
-  if (!mgmt) return setStatus('写入 AI 提供商需要 CPA 管理密钥，请填上面的输入框', 'bad');
+  const mgmt = $('mgmtKey').value.trim();
+  if (!key) return setStatus('先填要换成的 key', 'bad');
+  if (!mgmt) return setStatus('写进 AI 提供商需要 CPA 管理密钥（这一步会改 CPA 配置）', 'bad');
   $('connectBtn').disabled = true;
   setStatus('正在写入 AI 提供商…');
   try {
-    const resp = await fetch(managementURL('connect'), {
+    const resp = await fetch('{{mgmtURL}}connect', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Management-Key': mgmt, Authorization: 'Bearer ' + mgmt },
       body: JSON.stringify({ plan_key: key, api_key: key, base_url: base }),
@@ -188,8 +137,7 @@ async function connect() {
     }
     const p = data.provider;
     box.className = 'stat ok';
-    box.innerHTML = (p.created ? '已添加' : '已更新') + '「' + p.name + '」，Base URL <code>' +
-      p.base_url + '</code>，' + p.models.length + ' 个模型。刷新「AI 提供商」页即可看到。';
+    box.innerHTML = (p.created ? '已添加' : '已更新') + '「' + p.name + '」，' + p.models.length + ' 个模型。<br>刷新「AI 提供商」页即可看到。';
     setStatus('');
   } catch (err) {
     setStatus('请求失败：' + err.message, 'bad');
@@ -197,10 +145,7 @@ async function connect() {
     $('connectBtn').disabled = false;
   }
 }
-
-$('refreshBtn').addEventListener('click', loadBalance);
 $('connectBtn').addEventListener('click', connect);
-loadBalance();
 </script>
 </body>
 </html>
