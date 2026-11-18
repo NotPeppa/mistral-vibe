@@ -168,6 +168,11 @@
   .notice.ok { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); color: #bbf7d0; }
   .notice svg { width: 16px; height: 16px; margin-top: 2px; flex: none; }
 
+  .usage-metric { display: flex; flex-direction: column; gap: 4px; }
+  .usage-metric .k { font-size: 12px; color: var(--text-3); }
+  .usage-metric .num { font-size: 19px; font-weight: 600; letter-spacing: -.02em; }
+  .usage-metric .accent { color: var(--accent); }
+
   .visually-hidden {
     position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
     overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
@@ -239,6 +244,26 @@
         <span class="pill ok" style="margin-left:10px">{{barPct}}%</span>
       </span>
     </div>
+  </section>
+
+  <section class="panel" aria-label="Token 用量">
+    <div class="panel-head">
+      <h2>Token 用量</h2>
+      <span class="sub mono" style="margin:0">累计 {{allRequests}} 次 · {{allTotal}} tokens</span>
+    </div>
+    <div class="rows" style="grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; padding: 16px 20px; border-bottom: 1px solid var(--line-soft)">
+      <div class="usage-metric"><span class="k">今日请求</span><span class="num strong">{{todayRequests}}</span></div>
+      <div class="usage-metric"><span class="k">今日输入</span><span class="num strong">{{todayInput}}</span></div>
+      <div class="usage-metric"><span class="k">今日输出</span><span class="num strong">{{todayOutput}}</span></div>
+      <div class="usage-metric"><span class="k">今日合计</span><span class="num strong accent">{{todayTotal}}</span></div>
+    </div>
+    <div class="row-head" role="row">
+      <span>模型</span><span>请求</span><span>输入</span><span>输出</span><span>占比</span><span>份额</span><span>合计</span>
+    </div>
+    <div class="rows">
+      {{modelRows}}
+    </div>
+    {{usageEmpty}}
   </section>
 
   {{note}}

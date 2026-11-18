@@ -5,3 +5,8 @@ dist/
 *.dll
 *.h
 !abi.h
+
+# plugin state: token usage ledger
+usage.json
+usage.json.tmp
+*.cpa-mistral-vibe.bak

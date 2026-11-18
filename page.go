@@ -50,6 +50,8 @@ func renderPage(ctx context.Context) []byte {
 		"barPct": "0", "barTone": "", "paygText": "",
 		"resetDate": "—", "resetCountdown": "",
 		"windows": "", "rows": "", "rowCount": "0 条",
+		"todayRequests": "0", "todayInput": "0", "todayOutput": "0", "todayTotal": "0",
+		"allRequests": "0", "allTotal": "0", "modelRows": "", "usageEmpty": "",
 		"note":    "",
 		"mgmtURL": "/v0/management/" + pluginID + "/",
 		"keyHint": "配置里还没有 key：在 <code>plugins.configs." + pluginID + "</code> 下填 <code>api_key</code> 后重启 CPA。",
@@ -58,6 +60,7 @@ func renderPage(ctx context.Context) []byte {
 		view["keyHint"] = "余额读自 <code>plugins.configs." + pluginID + ".api_key</code>，不需要在这里再填一次。"
 	}
 
+	renderUsage(view)
 	if cfg.apiKey == "" {
 		return fillPage(view)
 	}
@@ -188,4 +191,62 @@ func shortDate(stamp string) string {
 		return stamp[:10]
 	}
 	return stamp
+}
+
+// renderUsage fills the token-usage section from the ledger CPA feeds.
+func renderUsage(view map[string]string) {
+	usage := snapshotUsage()
+	view["todayRequests"] = formatCount(float64(usage.Today.Requests))
+	view["todayInput"] = formatCount(float64(usage.Today.Input))
+	view["todayOutput"] = formatCount(float64(usage.Today.Output))
+	view["todayTotal"] = formatCount(float64(usage.Today.Total))
+	view["allRequests"] = formatCount(float64(usage.All.Requests))
+	view["allTotal"] = formatCount(float64(usage.All.Total))
+	if usage.All.Requests == 0 {
+		view["usageEmpty"] = `<p class="sub" style="margin:0">还没有记录到请求。CPA 在每次调用完成后回调一次，这里会累积 token 数。</p>`
+		view["modelRows"] = ""
+		return
+	}
+	view["usageEmpty"] = ""
+	var b strings.Builder
+	for _, item := range usage.Models {
+		share := 0.0
+		if usage.All.Total > 0 {
+			share = float64(item.Total) / float64(usage.All.Total) * 100
+		}
+		failPill := ""
+		if item.Failed > 0 {
+			failPill = fmt.Sprintf(`<span class="pill bad" style="margin-left:8px">%d 失败</span>`, item.Failed)
+		}
+		fmt.Fprintf(&b, `<div class="row">
+  <div class="name"><span class="dot"></span><span class="mono">%s</span></div>
+  <div class="num">%s</div>
+  <div class="num">%s</div>
+  <div class="num">%s</div>
+  <div><div class="thin-bar" style="width:76px"><i style="width:%s%%"></i></div></div>
+  <div class="num">%s%%%s</div>
+  <div class="num muted">%s</div>
+</div>`,
+			html.EscapeString(item.Model),
+			formatCount(float64(item.Requests)),
+			formatCount(float64(item.Input)),
+			formatCount(float64(item.Output)),
+			trimFloat(share), trimFloat(share), failPill,
+			formatCount(float64(item.Total)),
+		)
+	}
+	view["modelRows"] = b.String()
+}
+
+// formatCount renders a token count the way the CLI does: 8.35k, 1.2M.
+func formatCount(value float64) string {
+	switch {
+	case value >= 1e9:
+		return trimFloat(value/1e9) + "B"
+	case value >= 1e6:
+		return trimFloat(value/1e6) + "M"
+	case value >= 1e4:
+		return trimFloat(value/1e3) + "k"
+	}
+	return trimFloat(value)
 }

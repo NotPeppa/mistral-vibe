@@ -145,6 +145,7 @@ func pluginDescriptor() []byte {
 				"auth_provider":  true,
 				"quota_provider": true,
 				"management_api": true,
+				"usage_plugin":   true,
 			},
 		}
 		descriptor, _ = json.Marshal(reg)
@@ -195,6 +196,14 @@ func handle(ctx context.Context, method string, body []byte) (json.RawMessage, e
 		}
 		resp, err := a.RefreshAuth(ctx, req)
 		return marshalErr(resp, err)
+
+	case pluginabi.MethodUsageHandle:
+		var record pluginapi.UsageRecord
+		if err := tolerantInto(body, &record); err != nil {
+			return nil, nil
+		}
+		a.HandleUsage(ctx, record)
+		return marshalOK(map[string]bool{"ok": true})
 
 	case pluginabi.MethodQuotaIdentifier:
 		return marshalOK(map[string]string{"identifier": providerID})
@@ -379,6 +388,8 @@ func (agent) RegisterManagement(_ context.Context, req pluginapi.ManagementRegis
 			{"Method": http.MethodGet, "Path": "/" + pluginID + "/connect", "Description": "Add the plan's key to CPA's AI providers as an OpenAI-compatible entry."},
 			{"Method": http.MethodPost, "Path": "/" + pluginID + "/connect", "Description": "Add or update the Mistral Vibe entry in CPA's AI providers."},
 			{"Method": http.MethodGet, "Path": "/" + pluginID + "/balance", "Description": "The plan's month: budget, spent, remaining and reset time."},
+			{"Method": http.MethodGet, "Path": "/" + pluginID + "/usage", "Description": "Token usage recorded from CPA's per-request callbacks."},
+			{"Method": http.MethodPost, "Path": "/" + pluginID + "/usage/reset", "Description": "Clear the token usage ledger."},
 			{"Method": http.MethodGet, "Path": "/" + pluginID + "/plan", "Description": "Raw plan read: whoami plus billing."},
 			{"Method": http.MethodGet, "Path": "/" + pluginID + "/render", "Description": "mistral-vibe CLI styled banner for the plan balance."},
 		},
@@ -468,6 +479,13 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 	// and the rate limits land in the banner too.
 	if base := strings.TrimSpace(firstNonEmpty(header("X-Vibe-Api-Base"), query("api_base"))); base != "" {
 		cred.APIBase = base
+	}
+	if strings.HasSuffix(req.Path, "/usage/reset") {
+		resetUsage()
+		return jsonRoute(http.StatusOK, map[string]any{"ok": true})
+	}
+	if strings.HasSuffix(req.Path, "/usage") {
+		return jsonRoute(http.StatusOK, snapshotUsage())
 	}
 	// connect: publish the key into CPA's own AI-provider list, then let CPA
 	// serve the traffic natively. The plan is a bonus, not a prerequisite.

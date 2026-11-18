@@ -13,7 +13,8 @@
 | `AuthProvider` (`mistral-vibe`) | 可选：认领「认证文件」页上传的凭证 |
 | `QuotaProvider` (`mistral-vibe`) | plan 与当月预算余额（面板余额卡） |
 | `ManagementAPI` | `/mistral-vibe/connect`、`/balance`、`/render` |
-| 资源页 | 「Mistral Vibe」页面：填 key → 一键加到 AI 提供商 + 看余额 |
+| `UsagePlugin` | 每次请求完成后记录 token 用量，持久化到 `usage.json` |
+| 资源页 | 用量仪表盘：计划余额 + 额度明细 + Token 用量 |
 
 **这个插件不转发流量。** 它把你的 key 写进 CPA 自己的 `openai-compatibility`
 列表，之后调用由 CPA 原生转发到 `api.mistral.ai/v1`——工具调用、流式、多模态
@@ -237,6 +238,37 @@ DSH / Claude Code / Codex
 **模型列表不是写死的。** 插件用你的 key 请求 `GET /v1/models`，把这个账号真正能用的
 模型全部写进去 —— 实测 **62 个**（chat、code、embed、OCR、audio 全都有），而不是只管
 那三个 Vibe 模型。读取失败时才退回 `mistral-vibe-cli-latest` 等三个 id。
+
+## Token 用量
+
+CPA 在每次请求完成后回调 `usage.handle`，带上上游报告的 token 计数。插件把它
+累加进一个账本（`usage.json`，和配置文件同目录），页面「Token 用量」一块显示：
+今日请求数 / 输入 / 输出 / 合计，以及按模型的拆分和占比。
+
+```json
+GET /v0/management/mistral-vibe/usage
+{"all":{"requests":3,"input":51,"output":6,"total":57,...},
+ "today":{"requests":3,...},
+ "models":[{"Model":"mistral-vibe-cli-latest","Requests":3,"Total":57}],
+ "recent":[{"at":"2026-11-18T22:43:01+08:00","model":"...","total":19}]}
+```
+
+清空：`POST /v0/management/mistral-vibe/usage/reset`。
+
+记账规则：
+
+- **只记录 CPA 回调的**。绕过 CPA 直接打 Mistral 的请求不会出现在这里。
+- **保留 200 条最近请求**，页面显示前 20 条；账本按需写入（最少间隔 3 秒），
+  写临时文件再 rename，不会写坏。
+- **今日**按本地日期滚动，跨天后自动清零。
+- token 数来自响应里的 `usage`，如果上游没报就是 0 —— 不估算、不补数。
+
+实测（真 CPA + 真 key，3 次调用）：
+
+```
+今日请求 3 · 今日输入 51 · 今日输出 6 · 今日合计 57
+模型 mistral-vibe-cli-latest · 请求 3 · 占比 100%
+```
 
 ## 面板上为什么看不到「Mistral」这张卡
 
