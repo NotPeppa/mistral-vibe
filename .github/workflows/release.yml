@@ -46,6 +46,8 @@ jobs:
   build:
     needs: test
     strategy:
+      # A platform that fails still lets the others publish.
+      fail-fast: false
       matrix:
         include:
           # CGO needs a C compiler for the target, so each platform builds on a
@@ -92,11 +94,18 @@ jobs:
           grep -aqF "$version" "$out" || { echo "version not stamped in $out" >&2; exit 1; }
 
           # A release asset is useless without the entry point CPA dlsyms.
-          if [[ "${{ matrix.goos }}" == "linux" ]]; then
+          if [[ "${GOOS}" == "linux" ]]; then
             nm -D "$out" | grep -q 'cliproxy_plugin_init'
           else
             nm -gU "$out" | grep -q '_cliproxy_plugin_init'
-            [[ "$(lipo -archs "$out")" == "$GOARCH" ]] || { echo "wrong arch"; exit 1; }
+            # lipo names an Intel slice x86_64 where GOARCH says amd64.
+            want="${GOARCH}"
+            [[ "${want}" == "amd64" ]] && want="x86_64"
+            archs="$(lipo -archs "$out")"
+            [[ "${archs}" == "${want}" ]] || {
+              echo "wrong arch: lipo says '${archs}', expected '${want}'" >&2
+              exit 1
+            }
           fi
 
           ( cd dist && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256" )
