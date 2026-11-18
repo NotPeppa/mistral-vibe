@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -23,9 +24,11 @@ import (
 // providerName is the entry label the CPA panel shows.
 const providerName = "Mistral Vibe"
 
-// compatModels are the model ids Mistral serves for a token plan; the entry
-// publishes them so clients can pick one.
-var compatModels = []string{modelVibe, modelVibeTools, modelVibeFast}
+// fallbackModels is what the entry publishes when the upstream model list cannot
+// be read. The real list comes from GET /v1/models with the plan's own key —
+// Mistral serves dozens of models and they change without notice, so a
+// hardcoded list would hide most of them.
+var fallbackModels = []string{modelVibe, modelVibeTools, modelVibeFast}
 
 const (
 	modelVibe      = "mistral-vibe-cli-latest"
@@ -147,8 +150,12 @@ func connectProviderAt(ctx context.Context, base, managementKey string, cred cre
 		return connectResult{}, err
 	}
 
-	models := make([]map[string]string, 0, len(compatModels))
-	for _, id := range compatModels {
+	modelIDs := listModels(ctx, mistralBase, key)
+	if len(modelIDs) == 0 {
+		modelIDs = fallbackModels
+	}
+	models := make([]map[string]string, 0, len(modelIDs))
+	for _, id := range modelIDs {
 		models = append(models, map[string]string{"name": id, "alias": id})
 	}
 	value := map[string]any{
@@ -162,13 +169,13 @@ func connectProviderAt(ctx context.Context, base, managementKey string, cred cre
 		if err := patchCompatProviderAt(ctx, base, managementKey, index, value); err != nil {
 			return connectResult{}, err
 		}
-		return connectResult{Created: false, Updated: true, Name: providerName, BaseURL: mistralBase + "/v1", Models: compatModels, Index: index}, nil
+		return connectResult{Created: false, Updated: true, Name: providerName, BaseURL: mistralBase + "/v1", Models: modelIDs, Index: index}, nil
 	}
 	index, err := appendCompatProviderAt(ctx, base, managementKey, append(entries, value))
 	if err != nil {
 		return connectResult{}, err
 	}
-	return connectResult{Created: true, Updated: false, Name: providerName, BaseURL: mistralBase + "/v1", Models: compatModels, Index: index}, nil
+	return connectResult{Created: true, Updated: false, Name: providerName, BaseURL: mistralBase + "/v1", Models: modelIDs, Index: index}, nil
 }
 
 // findProvider picks the entry this plugin owns: the one named like it, else one
@@ -313,7 +320,7 @@ func truncateText(text string, limit int) string {
 // The write is conservative: it only edits the `openai-compatibility` block,
 // keeps every other line, backs the file up first, and does nothing when the
 // entry is already there with the same key.
-func publishToConfigFile(cred credential) {
+func publishToConfigFile(ctx context.Context, cred credential) {
 	path := findConfigFile()
 	if path == "" {
 		return
@@ -322,7 +329,8 @@ func publishToConfigFile(cred credential) {
 	if err != nil || len(original) == 0 {
 		return
 	}
-	updated, changed := mergeCompatEntry(string(original), cred.apiBase(), firstNonEmpty(cred.APIKey, cred.PlanKey))
+	key := firstNonEmpty(cred.APIKey, cred.PlanKey)
+	updated, changed := mergeCompatEntry(string(original), cred.apiBase(), key, listModels(ctx, cred.apiBase(), key))
 	if !changed {
 		return
 	}
@@ -354,7 +362,7 @@ func findConfigFile() string {
 }
 
 // compatBlock renders the YAML block for this plugin's provider entry.
-func compatBlock(base, key string) string {
+func compatBlock(base, key string, modelIDs []string) string {
 	var b strings.Builder
 	b.WriteString("openai-compatibility:\n")
 	fmt.Fprintf(&b, "  - name: %q\n", providerName)
@@ -362,7 +370,7 @@ func compatBlock(base, key string) string {
 	b.WriteString("    api-key-entries:\n")
 	fmt.Fprintf(&b, "      - api-key: %q\n", key)
 	b.WriteString("    models:\n")
-	for _, id := range compatModels {
+	for _, id := range modelIDs {
 		fmt.Fprintf(&b, "      - name: %q\n        alias: %q\n", id, id)
 	}
 	return b.String()
@@ -374,8 +382,11 @@ func compatBlock(base, key string) string {
 // A hand-written `openai-compatibility` list is replaced as a whole, which is
 // why the caller keeps a backup: parsing YAML without a dependency means the
 // block replacement must be total to stay correct.
-func mergeCompatEntry(config, base, key string) (string, bool) {
-	want := compatBlock(base, key)
+func mergeCompatEntry(config, base, key string, modelIDs []string) (string, bool) {
+	if len(modelIDs) == 0 {
+		modelIDs = fallbackModels
+	}
+	want := compatBlock(base, key, modelIDs)
 	lines := strings.Split(config, "\n")
 
 	start := -1
@@ -407,4 +418,66 @@ func mergeCompatEntry(config, base, key string) (string, bool) {
 	}
 	rebuilt := strings.Join(lines[:start], "\n") + "\n" + want + strings.Join(lines[end:], "\n")
 	return rebuilt, true
+}
+
+// listModels reads the model ids the key can use, from GET {base}/v1/models.
+//
+// Mistral serves far more than the three Vibe ids — chat, code, embed, OCR,
+// audio, moderation — and the set changes without notice, so the provider entry
+// publishes what the account actually sees instead of a fixed list. An empty
+// result means the read failed and the caller falls back.
+func listModels(ctx context.Context, mistralBase, key string) []string {
+	body, err := managementGetAt(ctx, mistralBase+"/v1/models", key)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(payload.Data))
+	seen := make(map[string]struct{}, len(payload.Data))
+	for _, item := range payload.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// managementGetAt fetches a URL with the given bearer token.
+func managementGetAt(ctx context.Context, url, key string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimPrefix(key, "Bearer "))
+	request.Header.Set("Accept", "application/json")
+	response, err := apiClient().Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: status %d", url, response.StatusCode)
+	}
+	return body, nil
 }

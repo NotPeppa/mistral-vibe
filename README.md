@@ -228,7 +228,11 @@ DSH / Claude Code / Codex
    https://api.mistral.ai/v1/chat/completions
 ```
 
-插件只在你点「添加到 AI 提供商」时出现一次：写一条渠道，然后退场。
+插件只在你点「添加到 AI 提供商」（或启动时读到 `api_key`）出现一次：写一条渠道，然后退场。
+
+**模型列表不是写死的。** 插件用你的 key 请求 `GET /v1/models`，把这个账号真正能用的
+模型全部写进去 —— 实测 **62 个**（chat、code、embed、OCR、audio 全都有），而不是只管
+那三个 Vibe 模型。读取失败时才退回 `mistral-vibe-cli-latest` 等三个 id。
 
 ## 面板上为什么看不到「Mistral」这张卡
 

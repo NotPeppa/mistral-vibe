@@ -7,7 +7,7 @@ import (
 
 func TestMergeCompatEntryAppendsWhenMissing(t *testing.T) {
 	config := "port: 8317\nplugins:\n  enabled: true\n"
-	merged, changed := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k")
+	merged, changed := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k", []string{"a", "b"})
 	if !changed {
 		t.Fatal("expected a change")
 	}
@@ -25,8 +25,8 @@ func TestMergeCompatEntryAppendsWhenMissing(t *testing.T) {
 
 func TestMergeCompatEntryIsIdempotent(t *testing.T) {
 	config := "port: 8317\n"
-	once, _ := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k")
-	twice, changed := mergeCompatEntry(once, "https://api.mistral.ai", "mstrl_k")
+	once, _ := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k", []string{"a", "b"})
+	twice, changed := mergeCompatEntry(once, "https://api.mistral.ai", "mstrl_k", []string{"a", "b"})
 	if changed {
 		t.Fatalf("a second run must not rewrite:\n%s", twice)
 	}
@@ -37,8 +37,8 @@ func TestMergeCompatEntryIsIdempotent(t *testing.T) {
 
 func TestMergeCompatEntryUpdatesTheKey(t *testing.T) {
 	config := "port: 8317\n"
-	first, _ := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_old")
-	second, changed := mergeCompatEntry(first, "https://api.mistral.ai", "mstrl_new")
+	first, _ := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_old", []string{"a"})
+	second, changed := mergeCompatEntry(first, "https://api.mistral.ai", "mstrl_new", []string{"a"})
 	if !changed {
 		t.Fatal("a new key must be written")
 	}
@@ -55,7 +55,7 @@ openai-compatibility:
 gateway:
   enabled: true
 `
-	merged, changed := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k")
+	merged, changed := mergeCompatEntry(config, "https://api.mistral.ai", "mstrl_k", []string{"a", "b"})
 	if !changed {
 		t.Fatal("expected a change")
 	}
@@ -67,11 +67,24 @@ gateway:
 	}
 }
 
-func TestCompatBlockListsThePlanModels(t *testing.T) {
-	block := compatBlock("https://api.mistral.ai", "k")
-	for _, id := range compatModels {
+func TestCompatBlockListsTheGivenModels(t *testing.T) {
+	block := compatBlock("https://api.mistral.ai", "k", []string{"mistral-large-latest", "codestral-latest", "voxtral-mini-latest"})
+	for _, id := range []string{"mistral-large-latest", "codestral-latest", "voxtral-mini-latest"} {
 		if !strings.Contains(block, id) {
 			t.Errorf("model %s missing", id)
+		}
+	}
+}
+
+func TestCompatBlockFallsBackWhenNoModels(t *testing.T) {
+	// An empty list comes from a failed read; the block must still be usable.
+	merged, changed := mergeCompatEntry("port: 1\n", "https://api.mistral.ai", "k", nil)
+	if !changed {
+		t.Fatal("expected a write")
+	}
+	for _, id := range fallbackModels {
+		if !strings.Contains(merged, id) {
+			t.Errorf("fallback model %s missing", id)
 		}
 	}
 }

@@ -1317,7 +1317,7 @@ func publishConfiguredKey(ctx context.Context) {
 		return
 	}
 	cred := credential{PlanKey: key, APIKey: key, APIBase: firstNonEmpty(cfg.baseURL, defaultAPIBase)}
-	publishToConfigFile(cred)
+	publishToConfigFile(ctx, cred)
 }
 
 // managementBase is the loopback address of the CPA that hosts this plugin.

@@ -83,11 +83,9 @@ func TestConnectCreatesTheProvider(t *testing.T) {
 		t.Fatalf("key = %v", keys[0])
 	}
 	models, _ := entry["models"].([]any)
-	if len(models) != len(compatModels) {
+	// No /v1/models on the fake, so the fallback list is published.
+	if len(models) != len(fallbackModels) {
 		t.Fatalf("models = %v", models)
-	}
-	if name := models[0].(map[string]any)["name"]; name != modelVibe {
-		t.Fatalf("first model = %v", name)
 	}
 }
 
@@ -240,5 +238,48 @@ func TestSchemaVersionIsOldEnoughForShippedCPA(t *testing.T) {
 	}
 	if reg.SchemaVersion != schemaVersion {
 		t.Fatalf("descriptor says %d, package says %d", reg.SchemaVersion, schemaVersion)
+	}
+}
+
+func TestConnectPublishesTheUpstreamModelList(t *testing.T) {
+	// A stand-in for CPA's management API plus Mistral's /v1/models.
+	var written []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v0/management/openai-compatibility", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write([]byte(`{"openai-compatibility":[]}`))
+		case http.MethodPut:
+			written, _ = io.ReadAll(r.Body)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}
+	})
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[
+			{"id":"mistral-large-latest"},{"id":"codestral-latest"},
+			{"id":"voxtral-mini-latest"},{"id":"mistral-large-latest"}]}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	withManagementBase(t, server.URL)
+
+	result, err := connectProvider(context.Background(), "mgmt-key", credential{
+		PlanKey: "mstrl_k", APIKey: "mstrl_k", APIBase: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if len(result.Models) != 3 {
+		t.Fatalf("models = %v (duplicates must collapse)", result.Models)
+	}
+	if !strings.Contains(string(written), "codestral-latest") {
+		t.Fatalf("upstream models not published:\n%s", written)
+	}
+	if strings.Contains(string(written), "mistral-vibe-cli-fast") {
+		t.Fatalf("fallback leaked into a successful read:\n%s", written)
 	}
 }
