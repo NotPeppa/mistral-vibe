@@ -19,9 +19,11 @@
 列表，之后调用由 CPA 原生转发到 `api.mistral.ai/v1`——工具调用、流式、多模态
 全都是 CPA 和 Mistral 自己处理的，插件不在链路上。
 
-## 安装（下载现成的，不用编译）
+## 安装
 
-从 [Releases](https://github.com/NotPeppa/mistral-vibe/releases) 下载对应平台：
+### 1. 拿到文件
+
+从 [Releases](https://github.com/NotPeppa/mistral-vibe/releases) 下载：
 
 | 系统 | 文件 |
 | --- | --- |
@@ -32,14 +34,29 @@
 | Linux arm64 | `cpa-mistral-vibe-linux-arm64.so` |
 
 ```bash
-# 1. 校验
-shasum -a 256 -c cpa-mistral-vibe-darwin-arm64.dylib.sha256
+shasum -a 256 -c checksums.txt --ignore-missing
+```
 
-# 2. 放进 CPA 的插件目录（文件名随意，但要以 .dylib/.so 结尾）
+### 2. 文件名必须改对
+
+**CPA 从文件名推导插件 ID**（`internal/pluginhost/platform.go`）：
+
+```go
+id := name                      // "cpa-mistral-vibe-darwin-arm64"
+if i := strings.LastIndex(name, "-v"); i > 0 { id, version = split(...) }
+```
+
+所以 `cpa-mistral-vibe-darwin-arm64.dylib` 会被当成 ID
+`cpa-mistral-vibe-darwin-arm64`，和配置里的 `cpa-mistral-vibe` **对不上，
+插件永远显示“未注册”**。
+
+**必须重命名成 `cpa-mistral-vibe.dylib`**（或 `.so`）：
+
+```bash
 cp cpa-mistral-vibe-darwin-arm64.dylib /path/to/cpa/plugins/cpa-mistral-vibe.dylib
 ```
 
-**3. 在 `config.yaml` 里启用** —— 少了这一段，插件只会被“发现”，永远 `registered: false`：
+### 3. key 直接写在 config.yaml
 
 ```yaml
 plugins:
@@ -48,42 +65,55 @@ plugins:
   configs:
     cpa-mistral-vibe:
       enabled: true
+      api_key: "mstrl_..."
+      base_url: "https://api.mistral.ai"   # 可省略，默认就是它
 ```
 
-重启 CPA，日志应出现：
+重启 CPA。插件在注册时读到 `api_key`，会把它写进同一个 `config.yaml` 的
+`openai-compatibility` 段（原文件备份为 `config.yaml.cpa-mistral-vibe.bak`），
+CPA 的文件监听随即加载：
 
 ```
-pluginhost: plugin registered plugin_id=cpa-mistral-vibe plugin_name=Mistral Vibe Token Plan version=v0.1.0
+pluginhost: plugin registered plugin_id=cpa-mistral-vibe version=0.1.0
+server clients and configuration updated: 1 clients (... + 1 OpenAI-compat)
 ```
 
-**4. 打开页面填 key**：
+实测（真 CPA + 真 key）：
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer <CPA 访问密钥>" \
+  -d '{"model":"mistral-vibe-cli-latest","messages":[{"role":"user","content":"hi"}]}'
+# → content: CFGKEY
+```
+
+### 4. 或者用页面（key 不写进配置也行）
 
 ```
 http://127.0.0.1:8317/v0/resource/plugins/cpa-mistral-vibe/page
 ```
 
-粘贴 key → 点「添加到 AI 提供商」。之后 CPA 的「AI 提供商」列表里就有
-`Mistral Vibe` 这一条，客户端可以直接用 `mistral-vibe-cli-latest`。
+**这个路径只在插件注册成功后才存在。** 未注册时一定 404，先解决第 2 步。
+
+### 面板上能看到的配置项
+
+| 字段 | 说明 |
+| --- | --- |
+| `api_key` | Mistral API key；填了就在启动时自动写入 AI 提供商 |
+| `base_url` | Mistral 地址，默认 `https://api.mistral.ai` |
+| `plan_base` | 读计划的 console 地址，默认 `https://console.mistral.ai` |
+| `model` | 余额横幅上显示的模型名 |
 
 ### 从源码编译（可选）
 
 ```bash
 git clone https://github.com/NotPeppa/mistral-vibe && cd mistral-vibe
-go mod download          # 依赖是 CLIProxyAPI v8.0.77 的公开 sdk，无需 CPA 源码
-make build               # 本机架构
+go mod download          # 依赖 CLIProxyAPI v8.0.77 的公开 sdk
+make build               # 本机架构；版本号会自动规整成 CPA 接受的格式
 make release             # 全部平台（Linux 目标需要 Linux 工具链）
-make universal           # macOS 通用包
-make verify              # 构建后校验版本戳与导出符号
+make verify              # 校验版本戳与导出符号
 make test                # 单测 + 真 C ABI 端到端
 ```
-
-| 平台 | 能在哪编译 |
-| --- | --- |
-| macOS arm64 / amd64 | 任意 macOS（Go 自带 clang 交叉编译） |
-| Linux amd64 / arm64 | 只能在 Linux 上（需要目标平台的 C 工具链） |
-
-CI 用三平台矩阵：ubuntu 出两个 Linux 包，macOS runner 出两个 Mac 包
-（clang 从 arm64 主机交叉编 x86_64），再由 `lipo` 合成通用包。
 
 ## key 是「一条凭证」，不是一份配置
 

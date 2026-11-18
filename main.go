@@ -108,6 +108,17 @@ var descriptor []byte
 // snake_case. Capabilities are booleans, one per capability CPA wires up.
 // validPlugin then requires a name, a version, an author, a repository, and at
 // least one capability, so all of them are spelled out here.
+// pluginDescriptor is the plugin.register result CPA reads.
+//
+// The wire schema is internal/pluginhost/rpc_schema.go's rpcRegistration:
+// Metadata is pluginapi.Metadata, whose fields carry NO json tags, so CPA decodes
+// "Name"/"Version"/"Author"/"GitHubRepository" — Go's default field names — not
+// snake_case. Capabilities are booleans, one per capability CPA wires up.
+// validPlugin then requires a name, a version, an author, a repository, and at
+// least one capability, so all of them are spelled out here.
+//
+// Version must satisfy ^[0-9][0-9A-Za-z.+-]*$: a leading "v" makes CPA reject the
+// plugin outright, which is why the build strips it from a tag.
 func pluginDescriptor() []byte {
 	descriptorOnce.Do(func() {
 		reg := map[string]any{
@@ -118,8 +129,10 @@ func pluginDescriptor() []byte {
 				"Author":           pluginAuthor,
 				"GitHubRepository": pluginRepo,
 				"ConfigFields": []map[string]any{
+					{"Name": "api_key", "Type": "string", "Default": "", "Description": "Mistral API key. The plugin publishes it to CPA's AI providers on load; leave it empty to enter the key on the plugin page instead."},
+					{"Name": "base_url", "Type": "string", "Default": defaultAPIBase, "Description": "Mistral base URL for the provider entry."},
 					{"Name": "plan_base", "Type": "string", "Default": defaultPlanBase, "Description": "Vibe console base URL used for the plan read."},
-					{"Name": "api_base", "Type": "string", "Default": defaultAPIBase, "Description": "Mistral inference base URL."},
+					{"Name": "model", "Type": "string", "Default": modelVibe, "Description": "Model shown on the balance banner."},
 				},
 			},
 			"capabilities": map[string]any{
@@ -137,9 +150,13 @@ func handle(ctx context.Context, method string, body []byte) (json.RawMessage, e
 	a := agent{}
 	switch method {
 	case pluginabi.MethodPluginRegister:
+		configure(registrationConfig(body))
+		publishConfiguredKey(ctx)
 		return json.RawMessage(pluginDescriptor()), nil
 	case pluginabi.MethodPluginReconfigure:
 		// CPA revalidates the answer, so reconfigure repeats the descriptor.
+		configure(registrationConfig(body))
+		publishConfiguredKey(ctx)
 		return json.RawMessage(pluginDescriptor()), nil
 	case pluginabi.MethodPluginQuiesce:
 		return marshalOK(map[string]bool{"ok": true})
@@ -1263,4 +1280,41 @@ func registrationWire(resp pluginapi.ManagementRegistrationResponse) (json.RawMe
 		return nil, err
 	}
 	return raw, nil
+}
+
+// registrationConfig pulls config_yaml out of a plugin.register/reconfigure
+// request: the raw YAML CPA keeps under plugins.configs.<pluginID>.
+//
+// ConfigYAML is a []byte on the wire, so encoding/json renders it as base64 and
+// decoding it straight into a []byte is what gives the text back.
+func registrationConfig(body []byte) []byte {
+	var envelope struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil
+	}
+	return envelope.ConfigYAML
+}
+
+// publishConfiguredKey makes a key from config.yaml usable without any page or
+// curl. It cannot call CPA's management API — the plugin never sees the
+// management key — so it publishes through the path CPA already watches: the
+// `openai-compatibility` list is config, and the config file is readable.
+//
+// Where that file is follows CPA's own rules: the auth directory's parent, or
+// the working directory of the CPA process.
+func publishConfiguredKey(ctx context.Context) {
+	cfg := currentConfig()
+	key := strings.TrimSpace(cfg.apiKey)
+	if key == "" {
+		return
+	}
+	cred := credential{PlanKey: key, APIKey: key, APIBase: firstNonEmpty(cfg.baseURL, defaultAPIBase)}
+	publishToConfigFile(cred)
+}
+
+// managementBase is the loopback address of the CPA that hosts this plugin.
+func (c pluginConfig) managementBase() string {
+	return ""
 }

@@ -302,3 +302,109 @@ func truncateText(text string, limit int) string {
 	}
 	return string(runes[:limit]) + "…"
 }
+
+// publishToConfigFile writes the Mistral Vibe entry into CPA's config.yaml.
+//
+// The plugin never sees CPA's management key, so it cannot use the management
+// API. But the provider list lives in the same config file CPA watches, and a
+// plugin runs inside that process with its working directory and auth dir, so
+// the entry can be merged in directly; CPA reloads the file on change.
+//
+// The write is conservative: it only edits the `openai-compatibility` block,
+// keeps every other line, backs the file up first, and does nothing when the
+// entry is already there with the same key.
+func publishToConfigFile(cred credential) {
+	path := findConfigFile()
+	if path == "" {
+		return
+	}
+	original, err := os.ReadFile(path)
+	if err != nil || len(original) == 0 {
+		return
+	}
+	updated, changed := mergeCompatEntry(string(original), cred.apiBase(), firstNonEmpty(cred.APIKey, cred.PlanKey))
+	if !changed {
+		return
+	}
+	if err := os.WriteFile(path+".cpa-mistral-vibe.bak", original, 0o600); err != nil {
+		return
+	}
+	_ = os.WriteFile(path, []byte(updated), 0o600)
+}
+
+// findConfigFile looks where CPA keeps its config: next to the auth directory,
+// then the process working directory, then the usual home location.
+func findConfigFile() string {
+	var candidates []string
+	if authDir := strings.TrimSpace(os.Getenv("CLIPROXY_AUTH_DIR")); authDir != "" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(authDir), "config.yaml"))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "config.yaml"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".cli-proxy-api", "config.yaml"))
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// compatBlock renders the YAML block for this plugin's provider entry.
+func compatBlock(base, key string) string {
+	var b strings.Builder
+	b.WriteString("openai-compatibility:\n")
+	fmt.Fprintf(&b, "  - name: %q\n", providerName)
+	fmt.Fprintf(&b, "    base-url: %q\n", base+"/v1")
+	b.WriteString("    api-key-entries:\n")
+	fmt.Fprintf(&b, "      - api-key: %q\n", key)
+	b.WriteString("    models:\n")
+	for _, id := range compatModels {
+		fmt.Fprintf(&b, "      - name: %q\n        alias: %q\n", id, id)
+	}
+	return b.String()
+}
+
+// mergeCompatEntry returns the config with this plugin's provider entry present
+// and carrying the given key, and whether anything changed.
+//
+// A hand-written `openai-compatibility` list is replaced as a whole, which is
+// why the caller keeps a backup: parsing YAML without a dependency means the
+// block replacement must be total to stay correct.
+func mergeCompatEntry(config, base, key string) (string, bool) {
+	want := compatBlock(base, key)
+	lines := strings.Split(config, "\n")
+
+	start := -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "openai-compatibility:") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		// No block yet: append it.
+		trimmed := strings.TrimRight(config, "\n")
+		return trimmed + "\n" + want, true
+	}
+	// The block runs until the next top-level key.
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		line := lines[i]
+		if line == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		end = i
+		break
+	}
+	// Compare without the blank line that precedes the next top-level key.
+	existing := strings.TrimRight(strings.Join(lines[start:end], "\n"), "\n") + "\n"
+	if existing == want {
+		return config, false
+	}
+	rebuilt := strings.Join(lines[:start], "\n") + "\n" + want + strings.Join(lines[end:], "\n")
+	return rebuilt, true
+}

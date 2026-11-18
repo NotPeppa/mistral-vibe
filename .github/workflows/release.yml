@@ -81,8 +81,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${VERSION}"
-          [[ "$version" == v* ]] || version="dev-$(git rev-parse --short=7 HEAD)"
+          # CPA validates the reported version with ^[0-9][0-9A-Za-z.+-]*$, so a
+          # tag's leading "v" would make the plugin unregistrable. Strip it.
+          version="${VERSION#v}"
+          [[ -n "$version" && "$VERSION" == v* ]] || version="0.0.0-dev.$(git rev-parse --short=7 HEAD)"
           out="dist/cpa-mistral-vibe-${GOOS}-${GOARCH}.${{ matrix.ext }}"
           mkdir -p dist
           go build -trimpath -buildmode=c-shared \

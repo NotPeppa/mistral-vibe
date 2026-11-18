@@ -8,8 +8,17 @@
 
 GO      ?= go
 DIST    := dist
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.buildVersion=$(VERSION)
+# CPA validates the reported version with ^[0-9][0-9A-Za-z.+-]*$ (no leading "v"),
+# and a git describe like "7d997db" fails it: the plugin would never register.
+# So a local build reports a numeric dev version and a tag reports its number.
+# An explicit VERSION (from a tag, or the command line) is normalised too, so
+# `make VERSION=v0.1.0` and `make VERSION=7d997db` both end up valid.
+RAW_VERSION := $(or $(VERSION),$(shell git describe --tags --always 2>/dev/null || echo 0.0.0))
+PLUGIN_VERSION := $(patsubst v%,%,$(RAW_VERSION))
+ifeq ($(shell echo '$(PLUGIN_VERSION)' | grep -Eq '^[0-9][0-9A-Za-z.+-]*$$' && echo ok),)
+PLUGIN_VERSION := 0.0.0-dev.$(shell git rev-parse --short=7 HEAD 2>/dev/null || echo local)
+endif
+LDFLAGS := -s -w -X main.buildVersion=$(PLUGIN_VERSION)
 
 UNAME := $(shell uname -s)
 ifeq ($(UNAME),Darwin)
@@ -34,7 +43,7 @@ all: build
 build:
 	@mkdir -p $(DIST)
 	CGO_ENABLED=1 $(GO) build -buildmode=c-shared -trimpath -ldflags "$(LDFLAGS)" -o $(OUT) .
-	@echo "built $(OUT) ($(VERSION))"
+	@echo "built $(OUT) ($(PLUGIN_VERSION))"
 
 # One shared library per platform, each with a .sha256 beside it.
 #
@@ -71,8 +80,8 @@ test:
 verify: build
 	@v=$$(basename $(OUT)); \
 	 nm -gU $(OUT) 2>/dev/null | grep -q cliproxy_plugin_init || nm -D $(OUT) | grep -q cliproxy_plugin_init || { echo "missing cliproxy_plugin_init"; exit 1; }; \
-	 grep -aq "$(VERSION)" $(OUT) || { echo "version $(VERSION) is not stamped in $(OUT)"; exit 1; }; \
-	 echo "verified $(OUT) ($(VERSION))"
+	 grep -aq "$(PLUGIN_VERSION)" $(OUT) || { echo "version $(PLUGIN_VERSION) is not stamped in $(OUT)"; exit 1; }; \
+	 echo "verified $(OUT) ($(PLUGIN_VERSION))"
 
 clean:
 	rm -rf $(DIST)
