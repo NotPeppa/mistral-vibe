@@ -39,11 +39,11 @@ plugin.register failed: plugin schema version 10 is not supported
 
 | 系统 | 文件 |
 | --- | --- |
-| macOS（Apple Silicon） | `cpa-mistral-vibe-darwin-arm64.dylib` |
-| macOS（Intel） | `cpa-mistral-vibe-darwin-amd64.dylib` |
-| macOS（两种都要） | `cpa-mistral-vibe-darwin-universal.dylib` |
 | Linux x86_64 | `cpa-mistral-vibe-linux-amd64.so` |
 | Linux arm64 | `cpa-mistral-vibe-linux-arm64.so` |
+
+macOS 不再发预编译包（GitHub 的 macOS runner 排队会拖住整个发布），
+Mac 用户按下面「从源码编译」自己编，本机架构直接 `make build`。
 
 ```bash
 shasum -a 256 -c checksums.txt --ignore-missing

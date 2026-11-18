@@ -18,7 +18,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,13 +50,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # CGO needs a C compiler for the target, so each platform builds on a
-          # runner of that platform; macOS covers both architectures because
-          # clang cross-builds x86_64 from an arm64 runner.
-          - {os: ubuntu-latest,  goos: linux,  goarch: amd64, ext: so}
-          - {os: ubuntu-latest,  goos: linux,  goarch: arm64, ext: so, cc: aarch64-linux-gnu-gcc}
-          - {os: macos-latest,   goos: darwin, goarch: arm64, ext: dylib}
-          - {os: macos-latest,   goos: darwin, goarch: amd64, ext: dylib}
+          # Linux only: a macOS runner queues for minutes and used to block the
+          # whole release behind it. CGO needs a C compiler for the target, so
+          # arm64 cross-builds with gcc-aarch64-linux-gnu.
+          - {os: ubuntu-latest, goos: linux, goarch: amd64, ext: so}
+          - {os: ubuntu-latest, goos: linux, goarch: arm64, ext: so, cc: aarch64-linux-gnu-gcc}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -96,19 +94,24 @@ jobs:
           grep -aqF "$version" "$out" || { echo "version not stamped in $out" >&2; exit 1; }
 
           # A release asset is useless without the entry point CPA dlsyms.
-          if [[ "${GOOS}" == "linux" ]]; then
-            nm -D "$out" | grep -q 'cliproxy_plugin_init'
-          else
-            nm -gU "$out" | grep -q '_cliproxy_plugin_init'
-            # lipo names an Intel slice x86_64 where GOARCH says amd64.
-            want="${GOARCH}"
-            [[ "${want}" == "amd64" ]] && want="x86_64"
-            archs="$(lipo -archs "$out")"
-            [[ "${archs}" == "${want}" ]] || {
-              echo "wrong arch: lipo says '${archs}', expected '${want}'" >&2
-              exit 1
-            }
+          nm -D "$out" | grep -q 'cliproxy_plugin_init' \
+            || { echo "cliproxy_plugin_init is missing from $out" >&2; exit 1; }
+
+          # Check the ELF machine word rather than `file -b`, which prints aarch64
+          # for a GOARCH of arm64 and would fail a naive comparison.
+          case "${GOARCH}" in
+            amd64) machine=$'\x3e\x00' ;;   # EM_X86_64 = 62
+            arm64) machine=$'\xb7\x00' ;;   # EM_AARCH64 = 183
+            *)     machine="" ;;
+          esac
+          if [[ -n "$machine" ]]; then
+            # ELF e_machine sits at offset 18 (little-endian).
+            got=$(od -An -tx1 -j18 -N2 "$out" | tr -d ' \n')
+            want=$(printf '%s' "$machine" | od -An -tx1 | tr -d ' \n')
+            [[ "$got" == "$want" ]] \
+              || { echo "ELF machine $got, expected $want for $GOARCH" >&2; exit 1; }
           fi
+          file -b "$out"
 
           ( cd dist && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256" )
 
@@ -119,33 +122,9 @@ jobs:
             dist/cpa-mistral-vibe-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}
             dist/cpa-mistral-vibe-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}.sha256
 
-  universal:
-    needs: build
-    runs-on: macos-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-      - name: lipo the two mac slices
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          lipo -create -output dist/cpa-mistral-vibe-darwin-universal.dylib \
-            artifacts/cpa-mistral-vibe-darwin-arm64/cpa-mistral-vibe-darwin-arm64.dylib \
-            artifacts/cpa-mistral-vibe-darwin-amd64/cpa-mistral-vibe-darwin-amd64.dylib
-          [[ "$(lipo -archs dist/cpa-mistral-vibe-darwin-universal.dylib)" == *"x86_64"* ]]
-          [[ "$(lipo -archs dist/cpa-mistral-vibe-darwin-universal.dylib)" == *"arm64"* ]]
-          ( cd dist && shasum -a 256 cpa-mistral-vibe-darwin-universal.dylib \
-              > cpa-mistral-vibe-darwin-universal.dylib.sha256 )
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cpa-mistral-vibe-darwin-universal
-          path: dist/cpa-mistral-vibe-darwin-universal.*
-
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, universal]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -173,11 +152,10 @@ jobs:
 
             | 系统 | 文件 |
             | --- | --- |
-            | macOS（Apple Silicon） | `cpa-mistral-vibe-darwin-arm64.dylib` |
-            | macOS（Intel） | `cpa-mistral-vibe-darwin-amd64.dylib` |
-            | macOS（两种都要） | `cpa-mistral-vibe-darwin-universal.dylib` |
             | Linux x86_64 | `cpa-mistral-vibe-linux-amd64.so` |
             | Linux arm64 | `cpa-mistral-vibe-linux-arm64.so` |
+
+            macOS 需要自行编译（`make build`），仓库不再出 dylib。
 
             校验：
 

@@ -2,7 +2,6 @@
 #
 #   make build        -> dist/cpa-mistral-vibe.<dylib|so|dll> for this machine
 #   make release      -> dist/cpa-mistral-vibe-<os>-<arch>.<ext> for every platform
-#   make universal    -> dist/cpa-mistral-vibe-darwin-universal.dylib (arm64 + amd64)
 #   make test         -> unit tests + C-ABI end-to-end
 #   make clean
 
@@ -31,12 +30,12 @@ endif
 
 OUT := $(DIST)/cpa-mistral-vibe.$(EXT)
 
-# The platforms a release ships. CGO is required: a plugin is a cgo shared
-# library, so cross-building needs a target C toolchain — the release workflow
-# builds the Linux ones on Linux for that reason.
-PLATFORMS ?= darwin-arm64 darwin-amd64 linux-amd64 linux-arm64
+# The platforms a release ships. Linux only: macOS builds queue for minutes on
+# a hosted runner and used to hold the whole release behind them, so a Mac user
+# builds locally with `make build` instead.
+PLATFORMS ?= linux-amd64 linux-arm64
 
-.PHONY: all build release universal test verify clean
+.PHONY: all build release test verify clean
 
 all: build
 
@@ -47,10 +46,10 @@ build:
 
 # One shared library per platform, each with a .sha256 beside it.
 #
-# CGO needs a C toolchain for the TARGET, so on macOS only the two darwin
-# entries build; the Linux ones report the missing cross compiler. The release
-# workflow runs this on ubuntu, where all four build. Override PLATFORMS to
-# build a subset locally: make release PLATFORMS="darwin-arm64 darwin-amd64"
+# CGO needs a C toolchain for the TARGET. On Linux, arm64 needs
+# gcc-aarch64-linux-gnu, which the release workflow installs. On macOS this
+# still works for the darwin targets via
+#   make release PLATFORMS="darwin-arm64 darwin-amd64"
 release:
 	@mkdir -p $(DIST)
 	@for p in $(PLATFORMS); do \
@@ -62,14 +61,6 @@ release:
 		( cd $(DIST) && shasum -a 256 $$(basename $$out) > $$(basename $$out).sha256 ) || exit 1; \
 	done
 	@echo "release artifacts in $(DIST)/"
-
-# A dylib both Apple Silicon and Intel Macs load.
-universal: release
-	@mkdir -p $(DIST)/tmp
-	@lipo -create -output $(DIST)/cpa-mistral-vibe-darwin-universal.dylib \
-		$(DIST)/cpa-mistral-vibe-darwin-arm64.dylib $(DIST)/cpa-mistral-vibe-darwin-amd64.dylib
-	@( cd $(DIST) && shasum -a 256 cpa-mistral-vibe-darwin-universal.dylib > cpa-mistral-vibe-darwin-universal.dylib.sha256 )
-	@echo "built $(DIST)/cpa-mistral-vibe-darwin-universal.dylib"
 
 test:
 	./tests/e2e.sh
