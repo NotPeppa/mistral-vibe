@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "cpa-mistral-vibe",
+  "name": "Mistral Vibe Token Plan",
+  "description": "Connect a Mistral Vibe token plan to CLIProxyAPI: reads the plan's month from Mistral billing, and publishes the key as an OpenAI-compatible AI provider so CPA serves Mistral natively (tools, streaming and images included).",
+  "author": "NotPeppa",
+  "version": "0.1.0",
+  "repository": "https://github.com/NotPeppa/mistral-vibe",
+  "homepage": "https://github.com/NotPeppa/mistral-vibe",
+  "license": "MIT",
+  "tags": [
+    "mistral",
+    "vibe",
+    "token-plan",
+    "quota",
+    "balance",
+    "openai-compatible"
+  ],
+  "install": {
+    "type": "github-release"
+  }
+}

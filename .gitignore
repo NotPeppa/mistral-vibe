@@ -1,0 +1,7 @@
+# build output (the release workflow builds fresh; nothing here is committed)
+dist/
+*.dylib
+*.so
+*.dll
+*.h
+!abi.h

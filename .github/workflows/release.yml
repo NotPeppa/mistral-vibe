@@ -1,0 +1,191 @@
+name: release
+
+# Tag a commit (git tag v0.1.0 && git push origin v0.1.0) and this publishes one
+# shared library per platform, each with its sha256, so installing needs no Go
+# toolchain. A plain push to main runs the tests only.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./...
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))"
+      - name: no secrets in tracked files
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          if git grep -nE 'mstrl_[A-Za-z0-9]{20,}' -- . ; then
+            echo "a Mistral key is committed" >&2
+            exit 1
+          fi
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          # CGO needs a C compiler for the target, so each platform builds on a
+          # runner of that platform; macOS covers both architectures because
+          # clang cross-builds x86_64 from an arm64 runner.
+          - {os: ubuntu-latest,  goos: linux,  goarch: amd64, ext: so}
+          - {os: ubuntu-latest,  goos: linux,  goarch: arm64, ext: so, cc: aarch64-linux-gnu-gcc}
+          - {os: macos-latest,   goos: darwin, goarch: arm64, ext: dylib}
+          - {os: macos-latest,   goos: darwin, goarch: amd64, ext: dylib}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: install the arm64 cross compiler
+        if: matrix.cc == 'aarch64-linux-gnu-gcc'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.cc }}
+          VERSION: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${VERSION}"
+          [[ "$version" == v* ]] || version="dev-$(git rev-parse --short=7 HEAD)"
+          out="dist/cpa-mistral-vibe-${GOOS}-${GOARCH}.${{ matrix.ext }}"
+          mkdir -p dist
+          go build -trimpath -buildmode=c-shared \
+            -ldflags "-s -w -X main.buildVersion=${version}" \
+            -o "$out" .
+
+          # The linker silently drops an -X that names a missing symbol, so an
+          # absent string means the version never landed.
+          grep -aqF "$version" "$out" || { echo "version not stamped in $out" >&2; exit 1; }
+
+          # A release asset is useless without the entry point CPA dlsyms.
+          if [[ "${{ matrix.goos }}" == "linux" ]]; then
+            nm -D "$out" | grep -q 'cliproxy_plugin_init'
+          else
+            nm -gU "$out" | grep -q '_cliproxy_plugin_init'
+            [[ "$(lipo -archs "$out")" == "$GOARCH" ]] || { echo "wrong arch"; exit 1; }
+          fi
+
+          ( cd dist && shasum -a 256 "$(basename "$out")" > "$(basename "$out").sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-mistral-vibe-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/cpa-mistral-vibe-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}
+            dist/cpa-mistral-vibe-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}.sha256
+
+  universal:
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: lipo the two mac slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          lipo -create -output dist/cpa-mistral-vibe-darwin-universal.dylib \
+            artifacts/cpa-mistral-vibe-darwin-arm64/cpa-mistral-vibe-darwin-arm64.dylib \
+            artifacts/cpa-mistral-vibe-darwin-amd64/cpa-mistral-vibe-darwin-amd64.dylib
+          [[ "$(lipo -archs dist/cpa-mistral-vibe-darwin-universal.dylib)" == *"x86_64"* ]]
+          [[ "$(lipo -archs dist/cpa-mistral-vibe-darwin-universal.dylib)" == *"arm64"* ]]
+          ( cd dist && shasum -a 256 cpa-mistral-vibe-darwin-universal.dylib \
+              > cpa-mistral-vibe-darwin-universal.dylib.sha256 )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpa-mistral-vibe-darwin-universal
+          path: dist/cpa-mistral-vibe-darwin-universal.*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, universal]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: flatten and collect checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find artifacts -type f \( -name '*.dylib' -o -name '*.so' \) -exec cp {} out/ \;
+          # One checksums.txt covering every asset, as the plugin store expects.
+          ( cd out && shasum -a 256 cpa-mistral-vibe-* | grep -v '\.sha256$' | awk '{ print $1"  "$2 }' > checksums.txt )
+          ls -la out/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            下载对应平台的文件即可，不需要 Go 或编译工具链。
+
+            | 系统 | 文件 |
+            | --- | --- |
+            | macOS（Apple Silicon） | `cpa-mistral-vibe-darwin-arm64.dylib` |
+            | macOS（Intel） | `cpa-mistral-vibe-darwin-amd64.dylib` |
+            | macOS（两种都要） | `cpa-mistral-vibe-darwin-universal.dylib` |
+            | Linux x86_64 | `cpa-mistral-vibe-linux-amd64.so` |
+            | Linux arm64 | `cpa-mistral-vibe-linux-arm64.so` |
+
+            校验：
+
+            ```bash
+            shasum -a 256 -c checksums.txt --ignore-missing
+            ```
+
+            放进 CPA 的插件目录（文件名要以 `.dylib` / `.so` 结尾，插件 ID 取自文件名），
+            然后在 `config.yaml` 里启用：
+
+            ```yaml
+            plugins:
+              enabled: true
+              dir: /path/to/plugins
+              configs:
+                cpa-mistral-vibe:
+                  enabled: true
+            ```
+
+            重启 CPA，打开
+            `http://127.0.0.1:8317/v0/resource/plugins/cpa-mistral-vibe/page`
+            粘贴 key → 点「添加到 AI 提供商」。
