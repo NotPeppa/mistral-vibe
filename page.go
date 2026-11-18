@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"html"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -41,76 +43,143 @@ func (pageHandler) HandleManagement(ctx context.Context, req pluginapi.Managemen
 func renderPage(ctx context.Context) []byte {
 	cfg := currentConfig()
 	view := map[string]string{
-		"plan":    "—",
-		"remain":  "—",
-		"spent":   "—",
-		"reset":   "—",
-		"windows": "",
-		"barPct":  "0",
-		"barTone": "",
+		"plan": "—", "planTone": "", "planFoot": "未配置 key",
+		"tier":   "—",
+		"remain": "—", "unit": "",
+		"spent": "—", "limit": "—",
+		"barPct": "0", "barTone": "", "paygText": "",
+		"resetDate": "—", "resetCountdown": "",
+		"windows": "", "rows": "", "rowCount": "0 条",
 		"note":    "",
 		"mgmtURL": "/v0/management/" + pluginID + "/",
-		"keyHint": "配置里还没有 key：在 plugins.configs." + pluginID + " 下填 api_key 后重启。",
+		"keyHint": "配置里还没有 key：在 <code>plugins.configs." + pluginID + "</code> 下填 <code>api_key</code> 后重启 CPA。",
 	}
 	if cfg.apiKey != "" {
-		view["keyHint"] = "余额读自 <code>plugins.configs." + pluginID + ".api_key</code>"
+		view["keyHint"] = "余额读自 <code>plugins.configs." + pluginID + ".api_key</code>，不需要在这里再填一次。"
 	}
 
-	plan, err := credential{
-		PlanKey: cfg.apiKey,
-		APIKey:  cfg.apiKey,
-		APIBase: cfg.baseUrl(),
-		BaseURL: cfg.planBaseOrDefault(),
-	}.readPlan(ctx)
+	if cfg.apiKey == "" {
+		return fillPage(view)
+	}
+
+	cred := credential{PlanKey: cfg.apiKey, APIKey: cfg.apiKey, APIBase: cfg.baseUrl(), BaseURL: cfg.planBaseOrDefault()}
+	plan, err := cred.readPlan(ctx)
+	if err != nil {
+		view["note"] = `<div class="notice bad"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16h.01"/></svg><span>读取失败：` + html.EscapeString(err.Error()) + `</span></div>`
+		return fillPage(view)
+	}
+
+	view["plan"] = html.EscapeString(firstNonEmpty(plan.Plan, "—"))
+	view["tier"] = html.EscapeString(firstNonEmpty(plan.Tier, "—"))
+	view["planFoot"] = "Mistral Vibe token plan"
+	if plan.Expires != "" {
+		view["planFoot"] = "有效期至 " + html.EscapeString(shortDate(plan.Expires))
+	}
+	if plan.Payg {
+		view["paygText"] = " · 超量按量计费"
+	}
+	view["barTone"], view["planTone"] = gaugeTone(plan)
+
+	if plan.HasBalance {
+		view["remain"] = trimFloat(plan.Balance)
+		view["unit"] = html.EscapeString(plan.Unit)
+		view["spent"] = trimFloat(plan.Spent)
+		if plan.Limit > 0 {
+			view["limit"] = trimFloat(plan.Limit) + " " + html.EscapeString(plan.Unit)
+			view["barPct"] = trimFloat(plan.Spent / plan.Limit * 100)
+		}
+	}
+	if plan.ResetAt != "" {
+		view["resetDate"] = html.EscapeString(shortDate(plan.ResetAt))
+		view["resetCountdown"] = html.EscapeString(countdown(plan.ResetAt))
+	}
+
+	var windows []string
+	for _, w := range plan.Windows {
+		windows = append(windows, html.EscapeString(w.Window)+" 剩余 "+trimFloat(w.Remaining*100)+"%")
+	}
+	view["windows"] = strings.Join(windows, " · ")
+
+	view["rows"] = renderRows(plan)
+	view["rowCount"] = "1 个凭据"
+	return fillPage(view)
+}
+
+// gaugeTone maps the used share to the card and pill tones.
+func gaugeTone(plan *planResponse) (bar, pill string) {
+	if plan == nil || plan.Limit <= 0 {
+		return "", "ok"
+	}
+	used := plan.Spent / plan.Limit * 100
 	switch {
-	case cfg.apiKey == "":
-		view["note"] = ""
-	case err != nil:
-		view["note"] = `<div class="stat bad">读取失败：` + html.EscapeString(err.Error()) + `</div>`
+	case used >= 90:
+		return " bad", "bad"
+	case used >= 75:
+		return " warn", "warn"
 	default:
-		view["plan"] = html.EscapeString(firstNonEmpty(plan.Plan, "—"))
-		if plan.HasBalance {
-			view["remain"] = html.EscapeString(formatMoney(plan.Balance, plan.Unit))
-			spent := formatMoney(plan.Spent, plan.Unit)
-			if plan.Limit > 0 {
-				spent += " / " + formatMoney(plan.Limit, plan.Unit)
-			}
-			view["spent"] = html.EscapeString(spent)
-			if plan.Limit > 0 {
-				pct := plan.Spent / plan.Limit * 100
-				view["barPct"] = trimFloat(pct)
-				switch {
-				case pct >= 90:
-					view["barTone"] = " bad"
-				case pct >= 75:
-					view["barTone"] = " warn"
-				}
-			}
-		}
-		if plan.ResetAt != "" {
-			view["reset"] = html.EscapeString(shortDate(plan.ResetAt))
-		}
-		var parts []string
-		for _, w := range plan.Windows {
-			parts = append(parts, html.EscapeString(w.Window)+" · 剩余 "+trimFloat(w.Remaining*100)+"%")
-		}
-		view["windows"] = strings.Join(parts, "　")
+		return "", "ok"
 	}
+}
 
+// renderRows draws one table row per plan window, the shape the Kiro usage page
+// uses: pool, share, used, remaining, reset.
+func renderRows(plan *planResponse) string {
+	if plan == nil || len(plan.Windows) == 0 {
+		return `<div class="row"><span class="muted">没有上报额度窗口</span><span></span><span></span><span></span><span></span><span></span><span></span></div>`
+	}
+	var b strings.Builder
+	for _, w := range plan.Windows {
+		used := clamp01(1 - w.Remaining)
+		tone := ""
+		if used >= 0.9 {
+			tone = " bad"
+		} else if used >= 0.75 {
+			tone = " warn"
+		}
+		fmt.Fprintf(&b, `<div class="row">
+  <div class="name"><span class="dot"></span><span class="mono">%s</span></div>
+  <div class="mono">%s</div>
+  <div class="muted">%s</div>
+  <div><div class="thin-bar%s" style="width:76px"><i style="width:%s%%"></i></div></div>
+  <div class="num">%s%%</div>
+  <div class="num">%s%%</div>
+  <div class="muted">%s</div>
+</div>`,
+			html.EscapeString(firstNonEmpty(plan.Plan, pluginID)),
+			html.EscapeString(firstNonEmpty(plan.Tier, "—")),
+			html.EscapeString(firstNonEmpty(w.Window, "window")),
+			tone, trimFloat(used*100),
+			trimFloat(used*100), trimFloat(w.Remaining*100),
+			html.EscapeString(firstNonEmpty(shortDate(w.Reset), "—")),
+		)
+	}
+	return b.String()
+}
+
+// countdown says how long is left, or nothing when the stamp is unreadable.
+func countdown(stamp string) string {
+	t, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		return ""
+	}
+	left := time.Until(t)
+	if left <= 0 {
+		return "已重置"
+	}
+	days := int(left.Hours()) / 24
+	hours := int(left.Hours()) % 24
+	if days > 0 {
+		return fmt.Sprintf("%d 天 %d 小时后", days, hours)
+	}
+	return fmt.Sprintf("%d 小时后", hours)
+}
+
+func fillPage(view map[string]string) []byte {
 	out := string(pageHTML)
 	for key, value := range view {
 		out = strings.ReplaceAll(out, "{{"+key+"}}", value)
 	}
 	return []byte(out)
-}
-
-// formatMoney keeps two decimals and appends the unit.
-func formatMoney(value float64, unit string) string {
-	text := trimFloat(value)
-	if unit != "" {
-		text += " " + unit
-	}
-	return text
 }
 
 // shortDate keeps the date part of an RFC 3339 stamp.
