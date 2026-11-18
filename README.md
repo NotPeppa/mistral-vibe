@@ -242,8 +242,19 @@ DSH / Claude Code / Codex
 ## Token 用量
 
 CPA 在每次请求完成后回调 `usage.handle`，带上上游报告的 token 计数。插件把它
-累加进一个账本（`usage.json`，和配置文件同目录），页面「Token 用量」一块显示：
-今日请求数 / 输入 / 输出 / 合计，以及按模型的拆分和占比。
+累加进一个账本（`usage.json`，和配置文件同目录），页面「Token 用量」一块显示
+**六个计数器**和按模型的拆分：
+
+| 计数器 | 来源 |
+| --- | --- |
+| 请求数 | 每次回调 |
+| 输入 | `usage.prompt_tokens` |
+| 输出 | `usage.completion_tokens` |
+| **缓存命中** | `usage.prompt_tokens_details.cached_tokens`，附带命中率 |
+| **推理** | `usage.completion_tokens_details.reasoning_tokens` |
+| 合计 | `usage.total_tokens` |
+
+缓存为 0 时页面写「本次无缓存命中」而不是 `0%` —— 没说就是没说，不编一个命中率。
 
 ```json
 GET /v0/management/mistral-vibe/usage

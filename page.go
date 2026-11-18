@@ -51,6 +51,7 @@ func renderPage(ctx context.Context) []byte {
 		"resetDate": "—", "resetCountdown": "",
 		"windows": "", "rows": "", "rowCount": "0 条",
 		"todayRequests": "0", "todayInput": "0", "todayOutput": "0", "todayTotal": "0",
+		"todayCached": "0", "todayReasoning": "0", "todayCacheRate": "—",
 		"allRequests": "0", "allTotal": "0", "modelRows": "", "usageEmpty": "",
 		"note":    "",
 		"mgmtURL": "/v0/management/" + pluginID + "/",
@@ -199,7 +200,10 @@ func renderUsage(view map[string]string) {
 	view["todayRequests"] = formatCount(float64(usage.Today.Requests))
 	view["todayInput"] = formatCount(float64(usage.Today.Input))
 	view["todayOutput"] = formatCount(float64(usage.Today.Output))
+	view["todayCached"] = formatCount(float64(usage.Today.Cached))
+	view["todayReasoning"] = formatCount(float64(usage.Today.Reasoning))
 	view["todayTotal"] = formatCount(float64(usage.Today.Total))
+	view["todayCacheRate"] = cacheRate(usage.Today)
 	view["allRequests"] = formatCount(float64(usage.All.Requests))
 	view["allTotal"] = formatCount(float64(usage.All.Total))
 	if usage.All.Requests == 0 {
@@ -218,20 +222,27 @@ func renderUsage(view map[string]string) {
 		if item.Failed > 0 {
 			failPill = fmt.Sprintf(`<span class="pill bad" style="margin-left:8px">%d 失败</span>`, item.Failed)
 		}
-		fmt.Fprintf(&b, `<div class="row">
-  <div class="name"><span class="dot"></span><span class="mono">%s</span></div>
+		fmt.Fprintf(&b, `<div class="row usage-row">
+  <div class="name"><span class="dot"></span><span class="mono">%s</span>%s</div>
+  <div class="num">%s</div>
+  <div class="num">%s</div>
+  <div class="num">%s</div>
   <div class="num">%s</div>
   <div class="num">%s</div>
   <div class="num">%s</div>
   <div><div class="thin-bar" style="width:76px"><i style="width:%s%%"></i></div></div>
-  <div class="num">%s%%%s</div>
-  <div class="num muted">%s</div>
+  <div class="num">%s%%</div>
+  <div class="num strong">%s</div>
 </div>`,
-			html.EscapeString(item.Model),
+			html.EscapeString(item.Model), failPill,
 			formatCount(float64(item.Requests)),
 			formatCount(float64(item.Input)),
 			formatCount(float64(item.Output)),
-			trimFloat(share), trimFloat(share), failPill,
+			formatCount(float64(item.Cached)),
+			formatCount(float64(item.Reasoning)),
+			formatCount(float64(item.Input+item.Output+item.Reasoning)),
+			trimFloat(share),
+			trimFloat(share),
 			formatCount(float64(item.Total)),
 		)
 	}
@@ -249,4 +260,15 @@ func formatCount(value float64) string {
 		return trimFloat(value/1e3) + "k"
 	}
 	return trimFloat(value)
+}
+
+// cacheRate renders the share of input tokens served from cache.
+func cacheRate(t usageTotals) string {
+	if t.Input == 0 {
+		return "—"
+	}
+	if t.Cached == 0 {
+		return "本次无缓存命中"
+	}
+	return trimFloat(float64(t.Cached)/float64(t.Input)*100) + "% 命中"
 }

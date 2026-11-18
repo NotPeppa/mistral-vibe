@@ -114,3 +114,34 @@ func TestUsageIgnoresEmptyRecords(t *testing.T) {
 		t.Fatalf("empty record counted: %+v", snap.All)
 	}
 }
+
+func TestUsageTracksCachedAndReasoning(t *testing.T) {
+	withLedgerDir(t)
+	recordUsage(pluginapi.UsageRecord{
+		Model: "mistral-vibe-cli-latest",
+		Detail: pluginapi.UsageDetail{
+			InputTokens: 1000, OutputTokens: 200,
+			CachedTokens: 800, CacheReadTokens: 800, CacheCreationTokens: 50,
+			ReasoningTokens: 120, TotalTokens: 1200,
+		},
+	})
+	snap := snapshotUsage()
+	if snap.All.Cached != 800 || snap.All.CacheRead != 800 || snap.All.CacheCreate != 50 {
+		t.Fatalf("cache counters = %+v", snap.All)
+	}
+	if snap.All.Reasoning != 120 {
+		t.Fatalf("reasoning = %d", snap.All.Reasoning)
+	}
+	if got := cacheRate(snap.All); got != "80% 命中" {
+		t.Fatalf("cacheRate = %q", got)
+	}
+}
+
+func TestCacheRateSaysNothingWhenThereIsNone(t *testing.T) {
+	if got := cacheRate(usageTotals{Input: 100}); got != "本次无缓存命中" {
+		t.Fatalf("got %q", got)
+	}
+	if got := cacheRate(usageTotals{}); got != "—" {
+		t.Fatalf("got %q", got)
+	}
+}
