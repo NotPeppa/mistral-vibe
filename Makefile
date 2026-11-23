@@ -52,13 +52,18 @@ build:
 #   make release PLATFORMS="darwin-arm64 darwin-amd64"
 release:
 	@mkdir -p $(DIST)
-	@for p in $(PLATFORMS); do \
+	@host_arch=$$(uname -m); \
+	for p in $(PLATFORMS); do \
 		os=$${p%-*}; arch=$${p#*-}; \
 		case $$os in darwin) ext=dylib ;; linux) ext=so ;; *) ext=dll ;; esac; \
 		out=$(DIST)/cpa-mistral-vibe-$$os-$$arch.$$ext; \
+		cc_env=""; \
+		if [ "$$os" = "linux" ] && [ "$$arch" = "arm64" ] && [ "$$host_arch" != "aarch64" ] && [ "$$host_arch" != "arm64" ]; then \
+			cc_env="CC=$${ARM64_CC:-aarch64-linux-gnu-gcc}"; \
+		fi; \
 		echo "building $$out"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=1 $(GO) build -buildmode=c-shared -trimpath -ldflags "$(LDFLAGS)" -o $$out . || exit 1; \
-		( cd $(DIST) && shasum -a 256 $$(basename $$out) > $$(basename $$out).sha256 ) || exit 1; \
+		env $$cc_env GOOS=$$os GOARCH=$$arch CGO_ENABLED=1 $(GO) build -buildmode=c-shared -trimpath -ldflags "$(LDFLAGS)" -o $$out . || exit 1; \
+		( cd $(DIST) && if command -v shasum >/dev/null 2>&1; then shasum -a 256 $$(basename $$out); else sha256sum $$(basename $$out); fi > $$(basename $$out).sha256 ) || exit 1; \
 	done
 	@echo "release artifacts in $(DIST)/"
 
@@ -71,7 +76,7 @@ test:
 verify: build
 	@v=$$(basename $(OUT)); \
 	 nm -gU $(OUT) 2>/dev/null | grep -q cliproxy_plugin_init || nm -D $(OUT) | grep -q cliproxy_plugin_init || { echo "missing cliproxy_plugin_init"; exit 1; }; \
-	 grep -aq "$(PLUGIN_VERSION)" $(OUT) || { echo "version $(PLUGIN_VERSION) is not stamped in $(OUT)"; exit 1; }; \
+	 grep -aqF "$(PLUGIN_VERSION)" $(OUT) || { echo "version $(PLUGIN_VERSION) is not stamped in $(OUT)"; exit 1; }; \
 	 echo "verified $(OUT) ($(PLUGIN_VERSION))"
 
 clean:

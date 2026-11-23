@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +48,13 @@ type usageTotals struct {
 	Total       int64 `json:"total"`
 }
 
+func effectiveTotal(d pluginapi.UsageDetail) int64 {
+	if d.TotalTokens != 0 {
+		return d.TotalTokens
+	}
+	return d.InputTokens + d.OutputTokens + d.ReasoningTokens
+}
+
 // add folds one record in.
 func (t *usageTotals) add(record pluginapi.UsageRecord) {
 	t.Requests++
@@ -59,11 +67,7 @@ func (t *usageTotals) add(record pluginapi.UsageRecord) {
 	t.Cached += record.Detail.CachedTokens
 	t.CacheRead += record.Detail.CacheReadTokens
 	t.CacheCreate += record.Detail.CacheCreationTokens
-	total := record.Detail.TotalTokens
-	if total == 0 {
-		total = record.Detail.InputTokens + record.Detail.OutputTokens
-	}
-	t.Total += total
+	t.Total += effectiveTotal(record.Detail)
 }
 
 // usageEntry is one retained request.
@@ -138,9 +142,52 @@ func rollDay(l *usageLedger, now time.Time) bool {
 	return true
 }
 
+// isMistralUsage filters CPA's global per-request callbacks so non-Mistral
+// traffic (Claude, Gemini, OpenAI, etc.) does not pollute the Mistral Vibe
+// token ledger.
+func isMistralUsage(record pluginapi.UsageRecord) bool {
+	prov := strings.ToLower(strings.TrimSpace(record.Provider))
+	authType := strings.ToLower(strings.TrimSpace(record.AuthType))
+	base := strings.TrimSpace(record.BaseURL)
+	// Records without routing metadata (synthetic/unit test inputs) pass through.
+	if prov == "" && base == "" && authType == "" {
+		return true
+	}
+	if strings.Contains(prov, "mistral") || strings.Contains(authType, "mistral") {
+		return true
+	}
+	if base != "" {
+		host := hostOf(base)
+		if host != "" {
+			if host == hostOf(defaultAPIBase) || strings.HasSuffix(host, ".mistral.ai") || host == "mistral.ai" {
+				return true
+			}
+			if cfgHost := hostOf(currentConfig().baseUrl()); cfgHost != "" && host == cfgHost {
+				return true
+			}
+			return false
+		}
+	}
+	if prov == "openai-compatibility" || authType == "openai-compatibility" {
+		model := strings.ToLower(firstNonEmpty(record.ResponseModel, record.Model, record.Alias))
+		for _, prefix := range []string{"mistral", "codestral", "devstral", "ministral", "pixtral", "voxtral", "magistral", "open-mistral", "open-mixtral"} {
+			if strings.Contains(model, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // recordUsage folds one CPA usage record into the ledger.
 func recordUsage(record pluginapi.UsageRecord) {
-	if record.Model == "" && record.Detail.TotalTokens == 0 {
+	model := firstNonEmpty(record.ResponseModel, record.Model, record.Alias)
+	if model == "" && !record.Failed && effectiveTotal(record.Detail) == 0 &&
+		record.Detail.InputTokens == 0 && record.Detail.OutputTokens == 0 && record.Detail.ReasoningTokens == 0 {
+		return
+	}
+	if !isMistralUsage(record) {
 		return
 	}
 	ledgerMu.Lock()
@@ -152,7 +199,6 @@ func recordUsage(record pluginapi.UsageRecord) {
 
 	l.All.add(record)
 	l.Today.add(record)
-	model := firstNonEmpty(record.ResponseModel, record.Model, record.Alias)
 	if model != "" {
 		bucket := l.Models[model]
 		if bucket == nil {
@@ -162,22 +208,20 @@ func recordUsage(record pluginapi.UsageRecord) {
 		bucket.add(record)
 	}
 
-	total := record.Detail.TotalTokens
-	if total == 0 {
-		total = record.Detail.InputTokens + record.Detail.OutputTokens
-	}
-	l.Recent = append([]usageEntry{{
+	entry := usageEntry{
 		At:     now.Format(time.RFC3339),
 		Model:  model,
 		Input:  record.Detail.InputTokens,
 		Output: record.Detail.OutputTokens,
 		Cached: record.Detail.CachedTokens,
-		Total:  total,
+		Total:  effectiveTotal(record.Detail),
 		Failed: record.Failed,
-	}}, l.Recent...)
-	if len(l.Recent) > ledgerRecentCap {
-		l.Recent = l.Recent[:ledgerRecentCap]
 	}
+	if len(l.Recent) < ledgerRecentCap {
+		l.Recent = append(l.Recent, usageEntry{})
+	}
+	copy(l.Recent[1:], l.Recent)
+	l.Recent[0] = entry
 	l.Updated = now.Format(time.RFC3339)
 
 	ledgerDirty = true
@@ -186,8 +230,8 @@ func recordUsage(record pluginapi.UsageRecord) {
 	}
 }
 
-// flushLedger writes the ledger if it changed. Called on every record and at
-// shutdown; the write is atomic through a temp file.
+// flushLedger writes the ledger if it changed. Called periodically on record
+// updates and on quiesce/shutdown; the write is atomic through a temp file.
 func flushLedger() {
 	ledgerMu.Lock()
 	defer ledgerMu.Unlock()
@@ -211,6 +255,7 @@ func flushLedgerLocked() {
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return
 	}
 	ledgerDirty = false
@@ -236,7 +281,9 @@ func snapshotUsage() usageSnapshot {
 	ledgerMu.Lock()
 	defer ledgerMu.Unlock()
 	l := currentLedger()
-	rollDay(l, time.Now())
+	if rollDay(l, time.Now()) {
+		ledgerDirty = true
+	}
 
 	out := usageSnapshot{All: l.All, Today: l.Today, Updated: l.Updated, Day: l.Day}
 	for model, totals := range l.Models {

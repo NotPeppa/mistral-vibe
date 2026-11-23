@@ -44,11 +44,11 @@ func rateLimitsFrom(header http.Header) *rateLimits {
 	out := &rateLimits{}
 	out.LimitTokens, out.HasTokens = read("x-ratelimit-limit-tokens-minute")
 	if remaining, ok := read("x-ratelimit-remaining-tokens-minute"); ok {
-		out.RemainingTokens, out.HasTokens = remaining, out.HasTokens || true
+		out.RemainingTokens, out.HasTokens = remaining, true
 	}
 	out.LimitRequests, out.HasRequests = read("x-ratelimit-limit-req-minute")
 	if remaining, ok := read("x-ratelimit-remaining-req-minute"); ok {
-		out.RemainingReqs, out.HasRequests = remaining, out.HasRequests || true
+		out.RemainingReqs, out.HasRequests = remaining, true
 	}
 	out.QueryCost, _ = read("x-ratelimit-tokens-query-cost")
 	if !out.HasTokens && !out.HasRequests {

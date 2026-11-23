@@ -162,3 +162,30 @@ func TestManagementKeyIsNeverUsedAsAMistralKey(t *testing.T) {
 		t.Fatalf("the management key leaked into an upstream call: %s", resp.Body)
 	}
 }
+
+func TestCredentialFromJSONHandlesAPIKeyAndKeepsPlanConsoleSeparate(t *testing.T) {
+	cred := credentialFromJSON([]byte(`{"api_key":"mstrl_only_api","base_url":"https://api.mistral.ai/v1"}`))
+	if cred.APIKey != "mstrl_only_api" {
+		t.Fatalf("api_key ignored: %+v", cred)
+	}
+	if cred.apiBase() != "https://api.mistral.ai" {
+		t.Fatalf("apiBase = %q, want https://api.mistral.ai", cred.apiBase())
+	}
+	// api.mistral.ai must never become planBase (which lives on console.mistral.ai).
+	if cred.planBase() != defaultPlanBase {
+		t.Fatalf("planBase = %q, want %q", cred.planBase(), defaultPlanBase)
+	}
+}
+
+func TestRefreshAuthPreservesAuthID(t *testing.T) {
+	resp, err := agent{}.RefreshAuth(context.Background(), pluginapi.AuthRefreshRequest{
+		AuthID:      "vibe-work",
+		StorageJSON: []byte(`{"inference_key":"mstrl_infer","plan":"Student"}`),
+	})
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if resp.Auth.ID != "vibe-work" {
+		t.Fatalf("Auth.ID = %q, want vibe-work", resp.Auth.ID)
+	}
+}

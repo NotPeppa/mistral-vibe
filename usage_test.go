@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
@@ -143,5 +145,56 @@ func TestCacheRateSaysNothingWhenThereIsNone(t *testing.T) {
 	}
 	if got := cacheRate(usageTotals{}); got != "—" {
 		t.Fatalf("got %q", got)
+	}
+	if got := cacheRate(usageTotals{Input: 100, Cached: 250}); got != "100% 命中" {
+		t.Fatalf("cache rate must clamp at 100%%, got %q", got)
+	}
+}
+
+func TestUsageFiltersNonMistralProviders(t *testing.T) {
+	withLedgerDir(t)
+	recordUsage(pluginapi.UsageRecord{
+		Provider: "claude",
+		Model:    "claude-sonnet-4",
+		Detail:   pluginapi.UsageDetail{InputTokens: 500, OutputTokens: 100, TotalTokens: 600},
+	})
+	recordUsage(pluginapi.UsageRecord{
+		Provider: "openai-compatibility",
+		BaseURL:  "https://api.openai.com/v1",
+		Model:    "gpt-4o",
+		Detail:   pluginapi.UsageDetail{InputTokens: 300, OutputTokens: 50, TotalTokens: 350},
+	})
+	recordUsage(pluginapi.UsageRecord{
+		Provider: "openai-compatibility",
+		BaseURL:  "https://api.mistral.ai/v1",
+		Model:    "mistral-large-latest",
+		Detail:   pluginapi.UsageDetail{InputTokens: 100, OutputTokens: 20, TotalTokens: 120},
+	})
+	snap := snapshotUsage()
+	if snap.All.Requests != 1 || snap.All.Total != 120 {
+		t.Fatalf("non-mistral traffic leaked into ledger: %+v", snap.All)
+	}
+}
+
+func TestUsageFlushesOnShutdown(t *testing.T) {
+	dir := withLedgerDir(t)
+	// First record triggers initial flush; second happens within ledgerFlushEvery.
+	recordUsage(record("mistral-vibe-cli-latest", 10, 5, 0, false))
+	recordUsage(record("mistral-vibe-cli-latest", 20, 10, 0, false))
+
+	if _, err := handle(context.Background(), pluginabi.MethodPluginShutdown, nil); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	ledgerMu.Lock()
+	ledger = nil
+	ledgerMu.Unlock()
+
+	if _, err := os.Stat(filepath.Join(dir, ledgerFileName)); err != nil {
+		t.Fatalf("ledger missing after shutdown: %v", err)
+	}
+	snap := snapshotUsage()
+	if snap.All.Requests != 2 || snap.All.Total != 45 {
+		t.Fatalf("shutdown did not flush pending record: %+v", snap.All)
 	}
 }

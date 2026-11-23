@@ -122,3 +122,39 @@ func TestMgmtDecodePreservesHeaderNames(t *testing.T) {
 		t.Fatalf("query key mangled: %v", req.Query)
 	}
 }
+
+func TestTolerantIntoPreservesTaggedFieldsAndNestedStructs(t *testing.T) {
+	body := []byte(`{"provider":"mistral-vibe","auth_index":"idx-42","auth_id":"aid-9","storage_json":{"plan_key":"sk-x"}}`)
+	var qReq pluginapi.QuotaFetchRequest
+	if err := tolerantInto(body, &qReq); err != nil {
+		t.Fatalf("quota decode: %v", err)
+	}
+	if qReq.AuthIndex != "idx-42" || qReq.AuthID != "aid-9" {
+		t.Fatalf("tagged fields lost: %+v", qReq)
+	}
+
+	usageBody := []byte(`{
+		"provider":"mistral-vibe",
+		"model":"mistral-large-latest",
+		"api_key":"k1",
+		"detail":{"input_tokens":120,"output_tokens":30,"cached_tokens":40,"total_tokens":150},
+		"response_headers":{"X-Custom-Header":["val"]}
+	}`)
+	var uRec pluginapi.UsageRecord
+	if err := tolerantInto(usageBody, &uRec); err != nil {
+		t.Fatalf("usage decode: %v", err)
+	}
+	if uRec.APIKey != "k1" || uRec.Detail.InputTokens != 120 || uRec.Detail.CachedTokens != 40 || uRec.Detail.TotalTokens != 150 {
+		t.Fatalf("nested usage detail lost: %+v", uRec)
+	}
+	if got := uRec.ResponseHeaders.Get("X-Custom-Header"); got != "val" {
+		t.Fatalf("response header mangled: %v", uRec.ResponseHeaders)
+	}
+}
+
+func TestStorageBytesDecodesNonJSONBase64(t *testing.T) {
+	// "hello world" in standard base64.
+	if got := storageBytes("aGVsbG8gd29ybGQ="); string(got) != "hello world" {
+		t.Fatalf("got %q, want %q", got, "hello world")
+	}
+}

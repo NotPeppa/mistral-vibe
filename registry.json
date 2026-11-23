@@ -4,7 +4,7 @@
   "name": "Mistral Vibe Token Plan",
   "description": "Connect a Mistral Vibe token plan to CLIProxyAPI: reads the plan's month from Mistral billing, and publishes the key as an OpenAI-compatible AI provider so CPA serves Mistral natively (tools, streaming and images included).",
   "author": "NotPeppa",
-  "version": "0.1.0",
+  "version": "0.2.4",
   "repository": "https://github.com/NotPeppa/mistral-vibe",
   "homepage": "https://github.com/NotPeppa/mistral-vibe",
   "license": "MIT",

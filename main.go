@@ -5,7 +5,7 @@
 //
 //	go build -buildmode=c-shared -o cpa-mistral-vibe.dylib .
 //
-// Contract source of truth: sdk/pluginabi (ABI + method names, schema 10) and
+// Contract source of truth: sdk/pluginabi (ABI + method names) and
 // sdk/pluginapi (payload types). The plugin never imports CPA internals.
 //
 // Capabilities advertised:
@@ -19,11 +19,12 @@
 //	quota.describe         plan + balance capability
 //	quota.fetch            normalized plan, balance and periodic allowance windows
 //	management.register    JSON routes under /v0/management/mistral-vibe/
+//	usage.handle           per-request token usage ledger
 //
 // Credential model (two keys, one record):
 //
-//	plan_key         x-api-key for console.vibe.mistral.ai — reads the plan
-//	inference_key    Bearer for api.mistral.ai             — spends it
+//	plan_key         x-api-key for console.mistral.ai — reads the plan
+//	inference_key    Bearer for api.mistral.ai        — spends it
 //
 // Every field of the upstream plan payload is optional; unknown shapes degrade
 // to "plan known, numbers unknown" instead of invented figures.
@@ -39,8 +40,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,11 +59,15 @@ var buildVersion = pluginVer
 
 const (
 	pluginName   = "Mistral Vibe Token Plan"
-	pluginVer    = "0.1.0"
+	pluginVer    = "0.2.4"
 	pluginAuthor = "NotPeppa"
 	pluginRepo   = "https://github.com/NotPeppa/mistral-vibe"
-	pluginID     = "mistral-vibe"
-	providerID   = "mistral-vibe"
+	// pluginID is the management route prefix and provider key.
+	pluginID   = "mistral-vibe"
+	providerID = "mistral-vibe"
+	// configPluginID matches the shared-library filename (cpa-mistral-vibe.so)
+	// that CPA uses as the key under plugins.configs.<id>.
+	configPluginID = "cpa-mistral-vibe"
 	// The plugin only uses the always-present capability set, so it declares the
 	// oldest schema that still covers it rather than the SDK's latest. CPA
 	// rejects a plugin whose schema is newer than its own:
@@ -73,11 +80,9 @@ const (
 	// resolves through a different edge and refused the same request.
 	defaultPlanBase = "https://console.mistral.ai"
 	defaultAPIBase  = "https://api.mistral.ai"
-	// planPath is what the plugin reads from the console. Verified live: the
-	// only endpoint answering a personal key is /api/vibe/whoami.
-	planPath     = "/api/vibe/whoami"
-	maxBodyBytes = 1 << 20
-	httpTimeout  = 12 * time.Second
+	maxBodyBytes    = 1 << 20
+	maxRPCBytes     = 16 << 20
+	httpTimeout     = 12 * time.Second
 )
 
 // --------------------------------------------------------------------------- ABI exports
@@ -102,18 +107,6 @@ func cpa_go_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api) C.int {
 var descriptorOnce sync.Once
 var descriptor []byte
 
-// pluginDescriptor is the plugin.register result CPA reads: metadata, the
-// capability flags it keys routing off, and the negotiated schema version.
-// Capabilities are declared here as booleans because the host consumes them
-// from the wire; the Go-side interface values above are what we implement.
-// pluginDescriptor is the plugin.register result CPA reads.
-//
-// The wire schema is internal/pluginhost/rpc_schema.go's rpcRegistration:
-// Metadata is pluginapi.Metadata, whose fields carry NO json tags, so CPA decodes
-// "Name"/"Version"/"Author"/"GitHubRepository" — Go's default field names — not
-// snake_case. Capabilities are booleans, one per capability CPA wires up.
-// validPlugin then requires a name, a version, an author, a repository, and at
-// least one capability, so all of them are spelled out here.
 // pluginDescriptor is the plugin.register result CPA reads.
 //
 // The wire schema is internal/pluginhost/rpc_schema.go's rpcRegistration:
@@ -166,8 +159,10 @@ func handle(ctx context.Context, method string, body []byte) (json.RawMessage, e
 		publishConfiguredKey(ctx)
 		return json.RawMessage(pluginDescriptor()), nil
 	case pluginabi.MethodPluginQuiesce:
+		flushLedger()
 		return marshalOK(map[string]bool{"ok": true})
 	case pluginabi.MethodPluginShutdown:
+		flushLedger()
 		return marshalOK(map[string]bool{"ok": true})
 
 	case pluginabi.MethodAuthIdentifier:
@@ -200,7 +195,7 @@ func handle(ctx context.Context, method string, body []byte) (json.RawMessage, e
 	case pluginabi.MethodUsageHandle:
 		var record pluginapi.UsageRecord
 		if err := tolerantInto(body, &record); err != nil {
-			return nil, nil
+			return marshalOK(map[string]bool{"ok": false})
 		}
 		a.HandleUsage(ctx, record)
 		return marshalOK(map[string]bool{"ok": true})
@@ -268,16 +263,13 @@ var (
 
 func (agent) Identifier() string { return providerID }
 
-// ParseAuth registers a token-plan credential. CPA calls this with the raw auth
-// file; a seed file with no key is accepted so the operator can fill it in.
 // ParseAuth claims the auth files the management UI uploads.
 //
 // CPA's uploader builds a generic Auth first and only then lets plugins see the
 // file, so a provider type CPA does not know never reaches the plugin unless the
 // file also carries a marker CPA copies into Auth.Metadata. `base_url` is one:
 // every Mistral credential needs it anyway, and an API key is required for the
-// executor to work at all — so "has a Mistral key" is the claim, and the two
-// accepted `type` values come along for clarity.
+// executor to work at all — so "has a Mistral key" is the claim.
 func (agent) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
 	if !claimsMistralFile(req) {
 		return pluginapi.AuthParseResponse{Handled: false}, nil
@@ -288,7 +280,7 @@ func (agent) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) (plugi
 
 // claimsMistralFile decides whether this file is ours.
 func claimsMistralFile(req pluginapi.AuthParseRequest) bool {
-	if req.Provider != "" && (strings.EqualFold(req.Provider, providerID) || strings.EqualFold(req.Provider, pluginID)) {
+	if req.Provider != "" && strings.EqualFold(req.Provider, providerID) {
 		return true
 	}
 	// A different known provider keeps its file.
@@ -296,10 +288,7 @@ func claimsMistralFile(req pluginapi.AuthParseRequest) bool {
 		return false
 	}
 	cred := credentialFromJSON(req.RawJSON)
-	if cred.PlanKey != "" && (cred.BaseURL != "" || cred.APIBase != "") {
-		return true
-	}
-	return cred.PlanKey != "" && req.Provider == pluginID
+	return cred.PlanKey != "" && (cred.BaseURL != "" || cred.APIBase != "")
 }
 
 // knownExternalProvider lists the provider types CPA already owns, so this
@@ -339,8 +328,12 @@ func (agent) RefreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) 
 	if plan, err := cred.readPlan(ctx); err == nil && plan != nil {
 		cred.absorb(plan)
 	}
+	auth := cred.toAuthData("")
+	if req.AuthID != "" {
+		auth.ID = req.AuthID
+	}
 	return pluginapi.AuthRefreshResponse{
-		Auth:             cred.toAuthData(""),
+		Auth:             auth,
 		NextRefreshAfter: time.Now().Add(6 * time.Hour).UTC(),
 	}, nil
 }
@@ -377,47 +370,56 @@ func (agent) ResetQuota(_ context.Context, _ pluginapi.QuotaResetRequest) (plugi
 	return pluginapi.QuotaResetResponse{Success: false, Message: "mistral-vibe quota is provider-managed"}, nil
 }
 
-func (agent) RegisterManagement(_ context.Context, req pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
-	// The response crosses the ABI as JSON, so it must contain no interface
-	// values: ManagementRoute.Handler is a pluginapi.ManagementHandler, which
-	// encoding/json cannot marshal. Routes are declared by path only (CPA routes
-	// every plugin route back to management.handle), and the resource page is
-	// declared by path too.
-	reg := map[string]any{
-		"routes": []map[string]any{
-			{"Method": http.MethodGet, "Path": "/" + pluginID + "/connect", "Description": "Add the plan's key to CPA's AI providers as an OpenAI-compatible entry."},
-			{"Method": http.MethodPost, "Path": "/" + pluginID + "/connect", "Description": "Add or update the Mistral Vibe entry in CPA's AI providers."},
-			{"Method": http.MethodGet, "Path": "/" + pluginID + "/balance", "Description": "The plan's month: budget, spent, remaining and reset time."},
-			{"Method": http.MethodGet, "Path": "/" + pluginID + "/usage", "Description": "Token usage recorded from CPA's per-request callbacks."},
-			{"Method": http.MethodPost, "Path": "/" + pluginID + "/usage/reset", "Description": "Clear the token usage ledger."},
-			{"Method": http.MethodGet, "Path": "/" + pluginID + "/plan", "Description": "Raw plan read: whoami plus billing."},
-			{"Method": http.MethodGet, "Path": "/" + pluginID + "/render", "Description": "mistral-vibe CLI styled banner for the plan balance."},
+func (agent) RegisterManagement(_ context.Context, _ pluginapi.ManagementRegistrationRequest) (pluginapi.ManagementRegistrationResponse, error) {
+	return pluginapi.ManagementRegistrationResponse{
+		Routes: []pluginapi.ManagementRoute{
+			{Method: http.MethodPost, Path: "/" + pluginID + "/connect", Description: "Add or update the Mistral Vibe entry in CPA's AI providers."},
+			{Method: http.MethodGet, Path: "/" + pluginID + "/balance", Description: "The plan's month: budget, spent, remaining and reset time."},
+			{Method: http.MethodGet, Path: "/" + pluginID + "/usage", Description: "Token usage recorded from CPA's per-request callbacks."},
+			{Method: http.MethodPost, Path: "/" + pluginID + "/usage/reset", Description: "Clear the token usage ledger."},
+			{Method: http.MethodGet, Path: "/" + pluginID + "/plan", Description: "Raw plan read: whoami plus billing."},
+			{Method: http.MethodGet, Path: "/" + pluginID + "/render", Description: "mistral-vibe CLI styled banner for the plan balance."},
 		},
-		"resources": []map[string]any{
-			{"Path": "/page", "Menu": "Mistral Vibe", "Description": "Plan balance and the AI-provider connect form."},
+		Resources: []pluginapi.ResourceRoute{
+			{Path: "/page", Menu: "Mistral Vibe", Description: "Plan balance and the AI-provider connect form."},
 		},
-	}
-	raw, err := json.Marshal(reg)
-	if err != nil {
-		return pluginapi.ManagementRegistrationResponse{}, err
-	}
-	var resp pluginapi.ManagementRegistrationResponse
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return pluginapi.ManagementRegistrationResponse{}, err
-	}
-	return resp, nil
+	}, nil
 }
 
 // --------------------------------------------------------------------------- management routes
 
 type manager struct{}
 
+func isPageRoute(path string) bool {
+	return strings.Contains(path, "/v0/resource/") || path == "/page" || path == "/"
+}
+
 func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementRequest) (pluginapi.ManagementResponse, error) {
 	// The resource page and the JSON routes share this handler; the path decides
 	// which one answers.
-	if strings.Contains(req.Path, "/v0/resource/") {
+	if isPageRoute(req.Path) {
 		return pageHandler{}.HandleManagement(ctx, req)
 	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	// Local usage routes do not require a Mistral API key.
+	if strings.HasSuffix(req.Path, "/usage/reset") {
+		if method != http.MethodPost {
+			return jsonRoute(http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed: use POST"})
+		}
+		resetUsage()
+		return jsonRoute(http.StatusOK, map[string]any{"ok": true})
+	}
+	if strings.HasSuffix(req.Path, "/usage") {
+		if method != http.MethodGet && method != http.MethodHead {
+			return jsonRoute(http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed: use GET"})
+		}
+		return jsonRoute(http.StatusOK, snapshotUsage())
+	}
+
 	// Headers and Query arrive as http.Header and url.Values, but the tolerant
 	// decoder hands them over as plain maps, so both shapes are read.
 	header := func(name string) string {
@@ -442,11 +444,20 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 		}
 		return ""
 	}
+
+	baseURLParam := strings.TrimSpace(firstNonEmpty(header("X-Vibe-Base-Url"), query("base_url")))
+	planBaseParam := strings.TrimSpace(firstNonEmpty(header("X-Vibe-Plan-Base"), query("plan_base")))
+	apiBaseParam := strings.TrimSpace(firstNonEmpty(header("X-Vibe-Api-Base"), query("api_base")))
+
 	cred := credential{
 		PlanKey: strings.TrimSpace(firstNonEmpty(header("X-Vibe-Plan-Key"), query("plan_key"))),
 		APIKey:  strings.TrimSpace(firstNonEmpty(header("X-Vibe-Api-Key"), query("api_key"))),
-		BaseURL: strings.TrimSpace(firstNonEmpty(header("X-Vibe-Base-Url"), query("base_url"))),
+		BaseURL: planBaseParam,
+		APIBase: apiBaseParam,
 		Label:   query("label"),
+	}
+	if baseURLParam != "" {
+		cred.applyGenericBase(baseURLParam)
 	}
 	// A POST body may carry the credential instead of headers, which is what the
 	// plugin page sends: the key never has to travel in a URL or a header there.
@@ -470,29 +481,21 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 		cred.APIBase = firstNonEmpty(cred.APIBase, cfg.baseUrl())
 		cred.BaseURL = firstNonEmpty(cred.BaseURL, cfg.planBaseOrDefault())
 	}
-	if cred.Empty() {
-		return jsonRoute(http.StatusBadRequest, map[string]any{
-			"error": "no Mistral key: set api_key under plugins.configs." + pluginID + " in config.yaml, or pass plan_key",
-		})
-	}
-	// The render route reads through the same path as quota.fetch so the month
-	// and the rate limits land in the banner too.
-	if base := strings.TrimSpace(firstNonEmpty(header("X-Vibe-Api-Base"), query("api_base"))); base != "" {
-		cred.APIBase = base
-	}
-	if strings.HasSuffix(req.Path, "/usage/reset") {
-		resetUsage()
-		return jsonRoute(http.StatusOK, map[string]any{"ok": true})
-	}
-	if strings.HasSuffix(req.Path, "/usage") {
-		return jsonRoute(http.StatusOK, snapshotUsage())
-	}
+
 	// connect: publish the key into CPA's own AI-provider list, then let CPA
 	// serve the traffic natively. The plan is a bonus, not a prerequisite.
 	if strings.HasSuffix(req.Path, "/connect") {
+		if method != http.MethodPost {
+			return jsonRoute(http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed: use POST"})
+		}
+		if cred.Empty() {
+			return jsonRoute(http.StatusBadRequest, map[string]any{
+				"error": "no Mistral key: set api_key under plugins.configs." + configPluginID + " in config.yaml, or pass plan_key",
+			})
+		}
 		// CPA already authenticated this request with its own management key;
 		// forwarding it is only needed to reach CPA's management API in turn.
-		managementKey := firstNonEmpty(header("X-Management-Key"), strings.TrimPrefix(header("Authorization"), "Bearer "), query("management_key"))
+		managementKey := firstNonEmpty(header("X-Management-Key"), bearerToken(header("Authorization")), query("management_key"))
 		var requested struct {
 			ManagementBase string `json:"management_base"`
 		}
@@ -503,6 +506,16 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 		}
 		return jsonRoute(http.StatusOK, map[string]any{"ok": true, "provider": result})
 	}
+
+	if method != http.MethodGet && method != http.MethodHead {
+		return jsonRoute(http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed: use GET"})
+	}
+	if cred.Empty() {
+		return jsonRoute(http.StatusBadRequest, map[string]any{
+			"error": "no Mistral key: set api_key under plugins.configs." + configPluginID + " in config.yaml, or pass plan_key",
+		})
+	}
+
 	plan, err := cred.readPlan(ctx)
 	if err != nil {
 		return jsonRoute(http.StatusBadGateway, map[string]any{"error": err.Error()})
@@ -519,6 +532,28 @@ func (manager) HandleManagement(ctx context.Context, req pluginapi.ManagementReq
 	default:
 		return jsonRoute(http.StatusOK, map[string]any{"ok": true, "plan": plan, "raw": plan.raw})
 	}
+}
+
+// bearerToken extracts the token from an HTTP Authorization: Bearer header
+// case-insensitively, ignoring non-Bearer schemes.
+func bearerToken(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < len("Bearer ") {
+		return ""
+	}
+	if !strings.EqualFold(value[:len("Bearer ")], "Bearer ") {
+		return ""
+	}
+	return strings.TrimSpace(value[len("Bearer "):])
+}
+
+// stripBearerPrefix removes an accidental leading "Bearer " from a raw API key.
+func stripBearerPrefix(key string) string {
+	key = strings.TrimSpace(key)
+	if len(key) >= len("Bearer ") && strings.EqualFold(key[:len("Bearer ")], "Bearer ") {
+		return strings.TrimSpace(key[len("Bearer "):])
+	}
+	return key
 }
 
 func jsonRoute(code int, body any) (pluginapi.ManagementResponse, error) {
@@ -552,63 +587,67 @@ type credential struct {
 
 func (c credential) Empty() bool { return c.PlanKey == "" && c.APIKey == "" }
 
+// applyGenericBase routes a generic `base_url` to APIBase, and only uses it as
+// BaseURL (plan console) when it is not Mistral's inference host (api.mistral.ai),
+// which does not serve /api/vibe/whoami.
+func (c *credential) applyGenericBase(base string) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return
+	}
+	c.APIBase = firstNonEmpty(c.APIBase, base)
+	if c.BaseURL == "" && hostOf(normalizeBase(base)) != hostOf(defaultAPIBase) {
+		c.BaseURL = base
+	}
+}
+
 func credentialFromJSON(raw []byte) credential {
 	var cred credential
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &cred)
-		var generic map[string]any
-		if json.Unmarshal(raw, &generic) == nil {
-			// The UI upload and hand-written seeds call the endpoint base_url;
-			// the struct calls it plan_base/api_base.
-			base := strings.TrimSpace(str(generic["base_url"]))
-			if base != "" {
-				cred.APIBase = firstNonEmpty(cred.APIBase, base)
-				if cred.BaseURL == "" {
-					cred.BaseURL = base
-				}
-			}
-			cred.Label = firstNonEmpty(cred.Label, str(generic["label"]), str(generic["email"]))
-		}
+	if len(raw) == 0 {
+		return cred
 	}
-	return cred.normalized()
+	_ = json.Unmarshal(raw, &cred)
+	var generic map[string]any
+	if json.Unmarshal(raw, &generic) == nil {
+		cred.APIKey = firstNonEmpty(cred.APIKey, str(generic["api_key"]), str(generic["apiKey"]))
+		cred.PlanKey = firstNonEmpty(cred.PlanKey, str(generic["planKey"]))
+		// The UI upload and hand-written seeds call the endpoint base_url;
+		// the struct calls it plan_base/api_base.
+		if base := strings.TrimSpace(str(generic["base_url"])); base != "" {
+			cred.applyGenericBase(base)
+		}
+		cred.Label = firstNonEmpty(cred.Label, str(generic["label"]), str(generic["email"]))
+	}
+	return cred
 }
 
 func credentialFromParts(storage []byte, meta map[string]any, attrs map[string]string) credential {
 	cred := credentialFromJSON(storage)
 	if meta != nil {
 		if raw, err := json.Marshal(meta); err == nil {
-			var fromMeta credential
-			if json.Unmarshal(raw, &fromMeta) == nil {
-				fromMeta = fromMeta.normalized()
-				cred.PlanKey = firstNonEmpty(cred.PlanKey, fromMeta.PlanKey)
-				cred.APIKey = firstNonEmpty(cred.APIKey, fromMeta.APIKey)
-				cred.BaseURL = firstNonEmpty(cred.BaseURL, fromMeta.BaseURL)
-				cred.APIBase = firstNonEmpty(cred.APIBase, fromMeta.APIBase)
-				cred.Plan = firstNonEmpty(cred.Plan, fromMeta.Plan)
-				cred.Tier = firstNonEmpty(cred.Tier, fromMeta.Tier)
-				if !cred.HasBal && fromMeta.HasBal {
-					cred.Balance, cred.HasBal = fromMeta.Balance, true
-				}
-				cred.Unit = firstNonEmpty(cred.Unit, fromMeta.Unit)
-				cred.Expires = firstNonEmpty(cred.Expires, fromMeta.Expires)
+			fromMeta := credentialFromJSON(raw)
+			cred.PlanKey = firstNonEmpty(cred.PlanKey, fromMeta.PlanKey)
+			cred.APIKey = firstNonEmpty(cred.APIKey, fromMeta.APIKey)
+			cred.BaseURL = firstNonEmpty(cred.BaseURL, fromMeta.BaseURL)
+			cred.APIBase = firstNonEmpty(cred.APIBase, fromMeta.APIBase)
+			cred.Plan = firstNonEmpty(cred.Plan, fromMeta.Plan)
+			cred.Tier = firstNonEmpty(cred.Tier, fromMeta.Tier)
+			if !cred.HasBal && fromMeta.HasBal {
+				cred.Balance, cred.HasBal = fromMeta.Balance, true
 			}
+			cred.Unit = firstNonEmpty(cred.Unit, fromMeta.Unit)
+			cred.Expires = firstNonEmpty(cred.Expires, fromMeta.Expires)
 		}
 	}
 	if attrs != nil {
-		cred.BaseURL = firstNonEmpty(cred.BaseURL, attrs["plan_base"], attrs["base_url"])
+		cred.BaseURL = firstNonEmpty(cred.BaseURL, attrs["plan_base"])
 		cred.APIBase = firstNonEmpty(cred.APIBase, attrs["api_base"])
+		if base := strings.TrimSpace(attrs["base_url"]); base != "" {
+			cred.applyGenericBase(base)
+		}
 		cred.Label = firstNonEmpty(cred.Label, attrs["label"], attrs["email"], attrs["name"])
 	}
-	return cred.normalized()
-}
-
-// normalized accepts the snake_case spelling this plugin writes plus the
-// camelCase spellings operators tend to paste in by hand.
-func (c credential) normalized() credential {
-	if c.PlanKey == "" {
-		c.PlanKey = ""
-	}
-	return c
+	return cred
 }
 
 func (c credential) toAuthData(fileName string) pluginapi.AuthData {
@@ -691,7 +730,10 @@ func (c *credential) absorb(plan *planResponse) {
 func (c credential) planBase() string {
 	return normalizeBase(firstNonEmpty(c.BaseURL, defaultPlanBase))
 }
-func (c credential) apiBase() string { return normalizeBase(firstNonEmpty(c.APIBase, defaultAPIBase)) }
+
+func (c credential) apiBase() string {
+	return normalizeAPIBase(firstNonEmpty(c.APIBase, defaultAPIBase))
+}
 
 func normalizeBase(base string) string {
 	base = strings.TrimSpace(base)
@@ -699,6 +741,16 @@ func normalizeBase(base string) string {
 		base = "https://" + base
 	}
 	return strings.TrimRight(base, "/")
+}
+
+// normalizeAPIBase strips a trailing /v1 suffix so callers appending /v1/...
+// never produce /v1/v1.
+func normalizeAPIBase(base string) string {
+	clean := normalizeBase(base)
+	if len(clean) > 3 && strings.EqualFold(clean[len(clean)-3:], "/v1") {
+		clean = strings.TrimRight(clean[:len(clean)-3], "/")
+	}
+	return clean
 }
 
 // --------------------------------------------------------------------------- plan read
@@ -726,8 +778,28 @@ type window struct {
 	Reset     string  `json:"resetTime,omitempty"`
 }
 
-var planPaths = []string{"/api/vibe/plan", "/api/vibe/subscription", "/api/vibe/whoami"}
+// /api/vibe/whoami is tried first because it is the endpoint that answers
+// personal Mistral keys; legacy /plan and /subscription paths remain fallbacks.
+var planPaths = []string{"/api/vibe/whoami", "/api/vibe/plan", "/api/vibe/subscription"}
 var planHeaderSets = [][]string{{"x-api-key"}, {"Authorization"}}
+
+func (c credential) resolvedPlanPaths() []string {
+	custom := strings.TrimSpace(currentConfig().planPath)
+	if custom == "" {
+		return planPaths
+	}
+	if !strings.HasPrefix(custom, "/") {
+		custom = "/" + custom
+	}
+	out := make([]string, 0, len(planPaths)+1)
+	out = append(out, custom)
+	for _, p := range planPaths {
+		if p != custom {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func (c credential) readPlan(ctx context.Context) (*planResponse, error) {
 	if c.PlanKey == "" {
@@ -736,10 +808,10 @@ func (c credential) readPlan(ctx context.Context) (*planResponse, error) {
 		}
 		return nil, fmt.Errorf("credential has no plan_key")
 	}
-	client := &http.Client{Timeout: httpTimeout, Transport: planTransport()}
+	client := apiClient()
 	var lastErr error
 	var live *rateLimits
-	for _, path := range planPaths {
+	for _, path := range c.resolvedPlanPaths() {
 		for _, headers := range planHeaderSets {
 			raw, limited, err := c.getJSON(ctx, client, c.planBase()+path, headers)
 			if limited != nil {
@@ -776,7 +848,7 @@ func (c credential) readPlan(ctx context.Context) (*planResponse, error) {
 func (c credential) attachBudget(ctx context.Context, client *http.Client, plan *planResponse, kind string) {
 	// One key reaches all three: whoami, billing and inference. A credential
 	// that names a separate inference key still bills on its plan key.
-	key := firstNonEmpty(c.APIKey, c.PlanKey)
+	key := firstNonEmpty(c.PlanKey, c.APIKey)
 	if key == "" {
 		return
 	}
@@ -824,7 +896,7 @@ func (c credential) getJSONBody(ctx context.Context, client *http.Client, url, k
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimPrefix(key, "Bearer "))
+	req.Header.Set("Authorization", "Bearer "+stripBearerPrefix(key))
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -841,27 +913,6 @@ func (c credential) getJSONBody(ctx context.Context, client *http.Client, url, k
 	return body, nil
 }
 
-// probeRateLimits spends one token to read the live allowance. Mistral returns
-// x-ratelimit-* only on inference answers, and that is the only balance a
-// personal token-plan key can see.
-func (c credential) probeRateLimits(ctx context.Context, client *http.Client) *rateLimits {
-	body := `{"model":"mistral-vibe-cli-fast","messages":[{"role":"user","content":"."}],"max_tokens":1}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.apiBase()+"/v1/chat/completions", strings.NewReader(body))
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
-	return rateLimitsFrom(resp.Header)
-}
-
 func (c credential) getJSON(ctx context.Context, client *http.Client, url string, headers []string) (map[string]any, *rateLimits, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -870,7 +921,7 @@ func (c credential) getJSON(ctx context.Context, client *http.Client, url string
 	for _, h := range headers {
 		value := c.PlanKey
 		if strings.EqualFold(h, "Authorization") {
-			value = "Bearer " + strings.TrimPrefix(value, "Bearer ")
+			value = "Bearer " + stripBearerPrefix(value)
 		}
 		req.Header.Set(h, value)
 	}
@@ -915,7 +966,7 @@ func shapePlan(raw map[string]any) *planResponse {
 		reset := firstNonEmpty(str(budget["resetAt"]), str(budget["reset_at"]), str(budget["period_end"]))
 		out.Windows = append(out.Windows, window{Group: firstNonEmpty(out.Plan, providerID), Window: "monthly", Remaining: remaining, Reset: reset})
 		if total, okTotal := firstNum(budget, "total", "total_amount", "limit"); okTotal && total > 0 {
-			out.Balance, out.HasBalance = total*(1-pct/100.0), true
+			out.Balance, out.HasBalance = max(0.0, total*(1-pct/100.0)), true
 			out.Unit = firstNonEmpty(str(budget["currency"]), str(budget["unit"]), "USD")
 		}
 	}
@@ -1035,21 +1086,24 @@ func (p *planResponse) toQuota() pluginapi.QuotaFetchResponse {
 func renderCLI(p *planResponse, model string) string {
 	eighths := []string{"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"}
 	bar := func(pct float64) string {
+		pct = clamp01(pct/100.0) * 100.0
 		steps := 48
 		step := int(pct/100.0*float64(steps) + 0.5)
 		switch {
 		case pct >= 100:
 			step = steps
-		case pct > 0 && step < 1:
+		case pct <= 0:
+			step = 0
+		case step < 1:
 			step = 1
-		case pct > 0 && step > steps-1:
+		case step > steps-1:
 			step = steps - 1
 		}
 		out := strings.Repeat(eighths[7], step/8)
 		if rest := step % 8; rest > 0 {
 			out += eighths[rest-1]
 		}
-		return out + strings.Repeat(" ", 6-max(0, len([]rune(out))))
+		return out + strings.Repeat(" ", max(0, 6-len([]rune(out))))
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "Mistral Vibe token plan\n")
@@ -1065,7 +1119,7 @@ func renderCLI(p *planResponse, model string) string {
 			fmt.Fprintf(&b, "balance %s %s\n", trimFloat(p.Balance), p.Unit)
 		}
 		for _, w := range p.Windows {
-			used := (1 - w.Remaining) * 100
+			used := clamp01(1-w.Remaining) * 100
 			label := firstNonEmpty(w.Window, "window")
 			// Sub-percent use would render as "0%" and hide a live signal; show
 			// one decimal below 1% so a fresh allowance still reads as measured.
@@ -1087,10 +1141,17 @@ func resetSuffix(reset string) string {
 }
 
 func trimFloat(v float64) string {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "0"
+	}
 	if v == float64(int64(v)) {
 		return fmt.Sprintf("%d", int64(v))
 	}
-	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", v), "0"), ".")
+	out := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", v), "0"), ".")
+	if out == "-0" {
+		return "0"
+	}
+	return out
 }
 
 func isCurrency(unit string) bool {
@@ -1131,10 +1192,8 @@ func num(v any) (float64, bool) {
 		f, err := t.Float64()
 		return f, err == nil
 	case string:
-		var f float64
-		if _, err := fmt.Sscanf(strings.TrimSpace(t), "%f", &f); err == nil {
-			return f, true
-		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+		return f, err == nil
 	}
 	return 0, false
 }
@@ -1180,19 +1239,12 @@ func firstNonEmpty(values ...string) string {
 
 func clamp01(v float64) float64 {
 	switch {
-	case v < 0:
+	case math.IsNaN(v), v < 0:
 		return 0
 	case v > 1:
 		return 1
 	}
 	return v
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func main() {}
@@ -1205,17 +1257,33 @@ func cpa_go_call(method *C.char, request *C.uint8_t, length C.size_t, response *
 }
 
 // call is the JSON-RPC entry the host reaches through cliproxy_plugin_call.
-func call(method *C.char, request *C.uint8_t, length C.size_t, response *C.cliproxy_buffer) C.int {
+func call(method *C.char, request *C.uint8_t, length C.size_t, response *C.cliproxy_buffer) (rc C.int) {
 	if response != nil {
 		response.ptr = nil
 		response.len = 0
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			envelope, _ := json.Marshal(pluginabi.Envelope{
+				OK:    false,
+				Error: &pluginabi.Error{Code: "plugin_panic", Message: fmt.Sprintf("panic: %v", r)},
+			})
+			rc = writeBuffer(envelope, response)
+		}
+	}()
 	name := ""
 	if method != nil {
 		name = C.GoString(method)
 	}
 	var body []byte
 	if request != nil && length > 0 {
+		if uint64(length) > maxRPCBytes {
+			envelope, _ := json.Marshal(pluginabi.Envelope{
+				OK:    false,
+				Error: &pluginabi.Error{Code: "plugin_error", Message: "request payload exceeds maximum size"},
+			})
+			return writeBuffer(envelope, response)
+		}
 		body = C.GoBytes(unsafe.Pointer(request), C.int(length))
 	}
 	result, err := handle(context.Background(), name, body)
@@ -1241,7 +1309,9 @@ func cpa_go_free(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cpa_go_shutdown
-func cpa_go_shutdown() {}
+func cpa_go_shutdown() {
+	flushLedger()
+}
 
 func writeBuffer(payload []byte, response *C.cliproxy_buffer) C.int {
 	if response == nil || len(payload) == 0 {
@@ -1320,7 +1390,7 @@ func registrationWire(resp pluginapi.ManagementRegistrationResponse) (json.RawMe
 }
 
 // registrationConfig pulls config_yaml out of a plugin.register/reconfigure
-// request: the raw YAML CPA keeps under plugins.configs.<pluginID>.
+// request: the raw YAML CPA keeps under plugins.configs.<id>.
 //
 // ConfigYAML is a []byte on the wire, so encoding/json renders it as base64 and
 // decoding it straight into a []byte is what gives the text back.
@@ -1338,9 +1408,6 @@ func registrationConfig(body []byte) []byte {
 // curl. It cannot call CPA's management API — the plugin never sees the
 // management key — so it publishes through the path CPA already watches: the
 // `openai-compatibility` list is config, and the config file is readable.
-//
-// Where that file is follows CPA's own rules: the auth directory's parent, or
-// the working directory of the CPA process.
 func publishConfiguredKey(ctx context.Context) {
 	cfg := currentConfig()
 	key := strings.TrimSpace(cfg.apiKey)
@@ -1349,9 +1416,4 @@ func publishConfiguredKey(ctx context.Context) {
 	}
 	cred := credential{PlanKey: key, APIKey: key, APIBase: firstNonEmpty(cfg.baseURL, defaultAPIBase)}
 	publishToConfigFile(ctx, cred)
-}
-
-// managementBase is the loopback address of the CPA that hosts this plugin.
-func (c pluginConfig) managementBase() string {
-	return ""
 }

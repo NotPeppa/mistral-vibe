@@ -122,10 +122,13 @@ func TestConnectUpdatesInsteadOfDuplicating(t *testing.T) {
 }
 
 func TestConnectAdoptsAHandAddedEntry(t *testing.T) {
-	// The operator already added Mistral by hand: adopt it, do not duplicate.
+	// The operator already added Mistral by hand: adopt it, do not duplicate,
+	// and preserve operator-configured fields like priority/prefix.
 	fake := &fakeManagement{entries: []map[string]any{{
 		"name":     "My Mistral",
 		"base-url": "https://api.mistral.ai/v1",
+		"priority": 10,
+		"prefix":   "mv/",
 	}}}
 	server := httptest.NewServer(fake.handler())
 	defer server.Close()
@@ -139,6 +142,10 @@ func TestConnectAdoptsAHandAddedEntry(t *testing.T) {
 	}
 	if !result.Updated || fake.putBody != nil {
 		t.Fatalf("expected an in-place update, got %+v (put=%v)", result, fake.putBody)
+	}
+	value, _ := fake.patched["value"].(map[string]any)
+	if value["prefix"] != "mv/" || value["priority"] != float64(10) {
+		t.Fatalf("operator fields lost on PATCH: %v", value)
 	}
 }
 
@@ -208,8 +215,22 @@ func TestResourcePathServesThePage(t *testing.T) {
 }
 
 func TestManagementPathStaysJSON(t *testing.T) {
-	resp, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+	// GET /connect must be rejected with 405 rather than mutating state.
+	getResp, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
 		Method:  "GET",
+		Path:    "/v0/management/mistral-vibe/connect",
+		Headers: map[string][]string{},
+		Query:   map[string][]string{},
+	})
+	if err != nil {
+		t.Fatalf("get connect: %v", err)
+	}
+	if getResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /connect status = %d, want 405", getResp.StatusCode)
+	}
+
+	resp, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method:  "POST",
 		Path:    "/v0/management/mistral-vibe/connect",
 		Headers: map[string][]string{},
 		Query:   map[string][]string{},
@@ -222,6 +243,62 @@ func TestManagementPathStaysJSON(t *testing.T) {
 	body := string(resp.Body)
 	if !strings.Contains(body, "plan_key") && !strings.Contains(body, "management key") && !strings.Contains(body, "Mistral key") {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestUsageRoutesWorkWithoutMistralKeyAndEnforceMethod(t *testing.T) {
+	withLedgerDir(t)
+	configure([]byte("enabled: true\n"))
+	defer configure(nil)
+
+	resp, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/v0/management/mistral-vibe/usage",
+		Headers: map[string][]string{},
+		Query:   map[string][]string{},
+	})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /usage failed without key: status=%d err=%v body=%s", resp.StatusCode, err, resp.Body)
+	}
+
+	// GET /usage/reset must be rejected with 405.
+	badReset, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodGet,
+		Path:    "/v0/management/mistral-vibe/usage/reset",
+		Headers: map[string][]string{},
+		Query:   map[string][]string{},
+	})
+	if err != nil || badReset.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /usage/reset status=%d err=%v", badReset.StatusCode, err)
+	}
+
+	okReset, err := manager{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method:  http.MethodPost,
+		Path:    "/v0/management/mistral-vibe/usage/reset",
+		Headers: map[string][]string{},
+		Query:   map[string][]string{},
+	})
+	if err != nil || okReset.StatusCode != http.StatusOK {
+		t.Fatalf("POST /usage/reset status=%d err=%v", okReset.StatusCode, err)
+	}
+}
+
+func TestManagementBaseRejectsNonLoopback(t *testing.T) {
+	if _, err := managementBaseFor("https://evil.example.com"); err == nil {
+		t.Fatal("expected non-loopback management_base to be rejected")
+	}
+	if got, err := managementBaseFor("http://127.0.0.1:8317/"); err != nil || got != "http://127.0.0.1:8317" {
+		t.Fatalf("loopback base rejected: got=%q err=%v", got, err)
+	}
+}
+
+func TestPortFromYAMLPrefersTopLevelAndAllowsComments(t *testing.T) {
+	yaml := `proxy:
+  port: 9999
+port: 8318 # CPA listen port
+`
+	if got := portFromYAML(yaml); got != "8318" {
+		t.Fatalf("portFromYAML = %q, want 8318", got)
 	}
 }
 

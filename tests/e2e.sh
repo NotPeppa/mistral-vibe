@@ -11,7 +11,13 @@ case "$(uname -s)" in
 	Darwin) EXT="dylib" ;;
 	*) EXT="so" ;;
 esac
-LIB="${PLUGIN_LIB:-$(mktemp -t cpa-mistral-vibe).$EXT}"
+LIB_TEMP=""
+if [[ -n "${PLUGIN_LIB:-}" ]]; then
+	LIB="$PLUGIN_LIB"
+else
+	LIB_TEMP="$(mktemp -t cpa-mistral-vibe)"
+	LIB="${LIB_TEMP}.$EXT"
+fi
 HARNESS="$(mktemp -t hosttest)"
 LOGFILE="$(mktemp -t fakevibe)"
 
@@ -21,6 +27,9 @@ cleanup() {
 		wait "$SERVER_PID" 2>/dev/null || true
 	fi
 	rm -f "$HARNESS" "$LOGFILE"
+	if [[ -n "$LIB_TEMP" ]]; then
+		rm -f "$LIB_TEMP" "$LIB" "${LIB%.*}.h"
+	fi
 }
 trap cleanup EXIT
 

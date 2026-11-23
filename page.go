@@ -43,11 +43,11 @@ func (pageHandler) HandleManagement(ctx context.Context, req pluginapi.Managemen
 func renderPage(ctx context.Context) []byte {
 	cfg := currentConfig()
 	view := map[string]string{
-		"plan": "—", "planTone": "", "planFoot": "未配置 key",
+		"plan": "—", "planTone": "ok", "planFoot": "未配置 key",
 		"tier":   "—",
 		"remain": "—", "unit": "",
 		"spent": "—", "limit": "—",
-		"barPct": "0", "barTone": "", "paygText": "",
+		"barPct": "0", "barWidth": "0", "barTone": "", "paygText": "",
 		"resetDate": "—", "resetCountdown": "",
 		"windows": "", "rows": "", "rowCount": "0 条",
 		"todayRequests": "0", "todayInput": "0", "todayOutput": "0", "todayTotal": "0",
@@ -55,10 +55,10 @@ func renderPage(ctx context.Context) []byte {
 		"allRequests": "0", "allTotal": "0", "modelRows": "", "usageEmpty": "",
 		"note":    "",
 		"mgmtURL": "/v0/management/" + pluginID + "/",
-		"keyHint": "配置里还没有 key：在 <code>plugins.configs." + pluginID + "</code> 下填 <code>api_key</code> 后重启 CPA。",
+		"keyHint": "配置里还没有 key：在 <code>plugins.configs." + configPluginID + "</code> 下填 <code>api_key</code> 后重启 CPA。",
 	}
 	if cfg.apiKey != "" {
-		view["keyHint"] = "余额读自 <code>plugins.configs." + pluginID + ".api_key</code>，不需要在这里再填一次。"
+		view["keyHint"] = "余额读自 <code>plugins.configs." + configPluginID + ".api_key</code>，不需要在这里再填一次。"
 	}
 
 	renderUsage(view)
@@ -87,10 +87,13 @@ func renderPage(ctx context.Context) []byte {
 	if plan.HasBalance {
 		view["remain"] = trimFloat(plan.Balance)
 		view["unit"] = html.EscapeString(plan.Unit)
-		view["spent"] = trimFloat(plan.Spent)
 		if plan.Limit > 0 {
+			view["spent"] = trimFloat(plan.Spent)
 			view["limit"] = trimFloat(plan.Limit) + " " + html.EscapeString(plan.Unit)
-			view["barPct"] = trimFloat(plan.Spent / plan.Limit * 100)
+			rawPct := max(0.0, plan.Spent/plan.Limit*100)
+			clampedPct := min(100.0, rawPct)
+			view["barPct"] = trimFloat(rawPct)
+			view["barWidth"] = trimFloat(clampedPct)
 		}
 	}
 	if plan.ResetAt != "" {
@@ -100,7 +103,7 @@ func renderPage(ctx context.Context) []byte {
 
 	var windows []string
 	for _, w := range plan.Windows {
-		windows = append(windows, html.EscapeString(w.Window)+" 剩余 "+trimFloat(w.Remaining*100)+"%")
+		windows = append(windows, html.EscapeString(w.Window)+" 剩余 "+trimFloat(clamp01(w.Remaining)*100)+"%")
 	}
 	view["windows"] = strings.Join(windows, " · ")
 
@@ -133,7 +136,8 @@ func renderRows(plan *planResponse) string {
 	}
 	var b strings.Builder
 	for _, w := range plan.Windows {
-		used := clamp01(1 - w.Remaining)
+		rem := clamp01(w.Remaining)
+		used := clamp01(1 - rem)
 		tone := ""
 		if used >= 0.9 {
 			tone = " bad"
@@ -153,7 +157,7 @@ func renderRows(plan *planResponse) string {
 			html.EscapeString(firstNonEmpty(plan.Tier, "—")),
 			html.EscapeString(firstNonEmpty(w.Window, "window")),
 			tone, trimFloat(used*100),
-			trimFloat(used*100), trimFloat(w.Remaining*100),
+			trimFloat(used*100), trimFloat(rem*100),
 			html.EscapeString(firstNonEmpty(shortDate(w.Reset), "—")),
 		)
 	}
@@ -178,12 +182,14 @@ func countdown(stamp string) string {
 	return fmt.Sprintf("%d 小时后", hours)
 }
 
+// fillPage performs a single-pass replacement so values containing `{{...}}`
+// can never trigger secondary template substitution.
 func fillPage(view map[string]string) []byte {
-	out := string(pageHTML)
+	pairs := make([]string, 0, len(view)*2)
 	for key, value := range view {
-		out = strings.ReplaceAll(out, "{{"+key+"}}", value)
+		pairs = append(pairs, "{{"+key+"}}", value)
 	}
-	return []byte(out)
+	return []byte(strings.NewReplacer(pairs...).Replace(string(pageHTML)))
 }
 
 // shortDate keeps the date part of an RFC 3339 stamp.
@@ -216,12 +222,20 @@ func renderUsage(view map[string]string) {
 	for _, item := range usage.Models {
 		share := 0.0
 		if usage.All.Total > 0 {
-			share = float64(item.Total) / float64(usage.All.Total) * 100
+			share = clamp01(float64(item.Total)/float64(usage.All.Total)) * 100
 		}
 		failPill := ""
 		if item.Failed > 0 {
 			failPill = fmt.Sprintf(`<span class="pill bad" style="margin-left:8px">%d 失败</span>`, item.Failed)
 		}
+		// Billable tokens exclude cache-read tokens when Input includes Cached;
+		// never add Reasoning on top of Output since completion_tokens typically
+		// already accounts for reasoning tokens.
+		billableInput := item.Input - item.Cached
+		if billableInput < 0 {
+			billableInput = item.Input
+		}
+		billable := billableInput + item.Output
 		fmt.Fprintf(&b, `<div class="row usage-row">
   <div class="name"><span class="dot"></span><span class="mono">%s</span>%s</div>
   <div class="num">%s</div>
@@ -240,7 +254,7 @@ func renderUsage(view map[string]string) {
 			formatCount(float64(item.Output)),
 			formatCount(float64(item.Cached)),
 			formatCount(float64(item.Reasoning)),
-			formatCount(float64(item.Input+item.Output+item.Reasoning)),
+			formatCount(float64(billable)),
 			trimFloat(share),
 			trimFloat(share),
 			formatCount(float64(item.Total)),
@@ -270,5 +284,6 @@ func cacheRate(t usageTotals) string {
 	if t.Cached == 0 {
 		return "本次无缓存命中"
 	}
-	return trimFloat(float64(t.Cached)/float64(t.Input)*100) + "% 命中"
+	pct := min(100.0, max(0.0, float64(t.Cached)/float64(t.Input)*100))
+	return trimFloat(pct) + "% 命中"
 }

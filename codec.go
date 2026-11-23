@@ -9,17 +9,24 @@ import (
 	"sync"
 )
 
+type fieldInfo struct {
+	jsonKey   string
+	fieldName string
+	fieldType reflect.Type
+}
+
 var (
 	structCacheMu sync.Mutex
-	structCache   = map[reflect.Type]map[string]reflect.Type{}
+	structCache   = map[reflect.Type]map[string]fieldInfo{}
 )
 
-// tolerantIntoTarget lets one decoder accept every spelling CPA and operators
+// tolerantInto lets one decoder accept every spelling CPA and operators
 // actually use on the wire:
 //
 //   - StorageJSON serializes as base64 by Go's []byte rules, but seeds written
 //     by hand (and older plugin samples) carry a raw object.
-//   - Auth field names are PascalCase here, snake_case in raw auth files.
+//   - Field names may arrive as PascalCase, camelCase, snake_case, or kebab-case,
+//     whether or not the target SDK struct carries explicit json tags.
 //   - Numeric strings appear wherever a panel round-tripped a form value.
 //
 // It re-encodes a normalized map and unmarshals that into the target. Fields
@@ -59,59 +66,51 @@ func setByteFields(target any, source map[string]any) {
 	if value.Kind() != reflect.Struct {
 		return
 	}
-	kinds := byteFieldsOf(target)
-	if len(kinds) == 0 {
+	fields := structFields(elementType(target))
+	if len(fields) == 0 {
 		return
 	}
 	for key, raw := range source {
-		name := pascal(key)
-		if _, ok := kinds[name]; !ok {
+		info, ok := fields[canonicalLookup(key)]
+		if !ok || !isByteSlice(info.fieldType) {
 			continue
 		}
 		bytes := storageBytes(raw)
 		if bytes == nil {
 			continue
 		}
-		field := value.FieldByName(name)
+		field := value.FieldByName(info.fieldName)
 		if field.IsValid() && field.CanSet() && field.Kind() == reflect.Slice {
 			field.SetBytes(bytes)
 		}
 	}
 }
 
-// normalizeKeys maps snake_case, kebab-case and camelCase spellings onto the
-// PascalCase field names the SDK structs use. Map-shaped fields (http.Header,
-// url.Values) and raw JSON pass through untouched; byte slices go through
-// storageBytes, which accepts base64 or a raw object.
+// normalizeKeys maps snake_case, kebab-case, camelCase, and PascalCase
+// spellings onto the exact JSON key each SDK struct field expects (honouring
+// explicit json tags as well as untagged Go field names). Map-shaped fields
+// (http.Header, url.Values, metadata maps) pass through untouched; byte slices
+// go through storageBytes, which accepts base64 or a raw object.
 func normalizeKeys(in map[string]any, target any) map[string]any {
-	bytesFields := byteFieldsOf(target)
-	opaque := opaqueFieldsOf(target)
+	fields := structFields(elementType(target))
 	out := make(map[string]any, len(in))
 	for key, value := range in {
-		name := pascal(key)
-		if _, isOpaque := opaque[name]; isOpaque {
-			out[name] = value
-			continue
-		}
-		if _, isBytes := bytesFields[name]; isBytes {
-			if raw := storageBytes(value); raw != nil {
-				out[name] = base64.StdEncoding.EncodeToString(raw)
+		info, known := fields[canonicalLookup(key)]
+		if known {
+			if info.fieldType.Kind() == reflect.Map {
+				out[info.jsonKey] = value
+				continue
 			}
+			if isByteSlice(info.fieldType) {
+				if raw := storageBytes(value); raw != nil {
+					out[info.jsonKey] = base64.StdEncoding.EncodeToString(raw)
+				}
+				continue
+			}
+			out[info.jsonKey] = normalizeValue(value, info.fieldType)
 			continue
 		}
-		out[name] = normalizeValue(value, fieldTypeOf(target, name))
-	}
-	return out
-}
-
-// opaqueFieldsOf lists map-typed fields, which carry user data (header names,
-// query keys) whose own casing must never be rewritten.
-func opaqueFieldsOf(target any) map[string]struct{} {
-	out := map[string]struct{}{}
-	for name, fieldType := range structFields(elementType(target)) {
-		if fieldType.Kind() == reflect.Map {
-			out[name] = struct{}{}
-		}
+		out[pascal(key)] = value
 	}
 	return out
 }
@@ -122,18 +121,24 @@ func normalizeValue(value any, target reflect.Type) any {
 		if target == nil {
 			return typed
 		}
-		return normalizeKeys(typed, target)
-	case []any:
-		for i, item := range typed {
-			typed[i] = normalizeValue(item, elemTypeOf(target))
+		elem := elementType(target)
+		if elem == nil || elem.Kind() != reflect.Struct {
+			return typed
 		}
-		return typed
+		return normalizeKeys(typed, elem)
+	case []any:
+		elem := elemTypeOf(target)
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = normalizeValue(item, elem)
+		}
+		return out
 	default:
 		return value
 	}
 }
 
-// pascal turns any common key spelling into the SDK's Go field name.
+// pascal turns any common key spelling into a PascalCase Go field name.
 func pascal(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -162,8 +167,8 @@ func pascal(key string) string {
 	return out
 }
 
-// storageBytes accepts base64 (Go's []byte wire form), a raw JSON object, or a
-// JSON string holding either.
+// storageBytes accepts base64 (Go's []byte wire form), a raw JSON object, a
+// JSON string holding either, or a numeric byte array.
 func storageBytes(value any) []byte {
 	switch typed := value.(type) {
 	case nil:
@@ -176,7 +181,7 @@ func storageBytes(value any) []byte {
 		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 			return []byte(trimmed)
 		}
-		if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && json.Valid(decoded) {
+		if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil {
 			return decoded
 		}
 		return []byte(trimmed)
@@ -187,13 +192,13 @@ func storageBytes(value any) []byte {
 	case []any:
 		bytes := make([]byte, 0, len(typed))
 		for _, item := range typed {
-			if n, ok := numeric(item); ok && n >= 0 && n <= 255 {
-				bytes = append(bytes, byte(n))
+			n, ok := numeric(item)
+			if !ok || n < 0 || n > 255 {
+				return nil
 			}
+			bytes = append(bytes, byte(n))
 		}
-		if json.Valid(bytes) {
-			return bytes
-		}
+		return bytes
 	}
 	return nil
 }
@@ -216,15 +221,33 @@ func numeric(value any) (float64, bool) {
 
 // -- reflection helpers ------------------------------------------------------
 
+func canonicalLookup(key string) string {
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range strings.TrimSpace(key) {
+		if r == '_' || r == '-' || r == ' ' {
+			continue
+		}
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func elementType(target any) reflect.Type {
-	t := reflect.TypeOf(target)
+	t, ok := target.(reflect.Type)
+	if !ok {
+		t = reflect.TypeOf(target)
+	}
 	for t != nil && t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	return t
 }
 
-func structFields(t reflect.Type) map[string]reflect.Type {
+func structFields(t reflect.Type) map[string]fieldInfo {
 	if t == nil || t.Kind() != reflect.Struct {
 		return nil
 	}
@@ -233,31 +256,37 @@ func structFields(t reflect.Type) map[string]reflect.Type {
 		structCacheMu.Unlock()
 		return cached
 	}
-	fields := make(map[string]reflect.Type, t.NumField())
+	fields := make(map[string]fieldInfo, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if field.PkgPath != "" {
 			continue
 		}
-		fields[field.Name] = field.Type
+		jsonKey := field.Name
+		if tag := field.Tag.Get("json"); tag != "" {
+			name := strings.Split(tag, ",")[0]
+			if name == "-" {
+				continue
+			}
+			if name != "" {
+				jsonKey = name
+			}
+		}
+		info := fieldInfo{
+			jsonKey:   jsonKey,
+			fieldName: field.Name,
+			fieldType: field.Type,
+		}
+		fields[canonicalLookup(field.Name)] = info
+		fields[canonicalLookup(jsonKey)] = info
 	}
 	structCache[t] = fields
 	structCacheMu.Unlock()
 	return fields
 }
 
-func fieldTypeOf(target any, name string) reflect.Type {
-	return structFields(elementType(target))[name]
-}
-
-func byteFieldsOf(target any) map[string]struct{} {
-	out := map[string]struct{}{}
-	for name, fieldType := range structFields(elementType(target)) {
-		if fieldType.Kind() == reflect.Slice && fieldType.Elem().Kind() == reflect.Uint8 {
-			out[name] = struct{}{}
-		}
-	}
-	return out
+func isByteSlice(t reflect.Type) bool {
+	return t != nil && t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8
 }
 
 func elemTypeOf(t reflect.Type) reflect.Type {
@@ -265,9 +294,7 @@ func elemTypeOf(t reflect.Type) reflect.Type {
 		return nil
 	}
 	switch t.Kind() {
-	case reflect.Slice, reflect.Array:
-		return t.Elem()
-	case reflect.Pointer:
+	case reflect.Slice, reflect.Array, reflect.Pointer:
 		return t.Elem()
 	}
 	return nil

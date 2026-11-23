@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/tls"
 	"net"
 	"net/http"
 	"net/url"
@@ -10,37 +9,44 @@ import (
 	"time"
 )
 
-// apiClient reaches Mistral and CPA's own management API. Go does not read the
-// OS proxy settings, so a machine that reaches Mistral only through a local
-// proxy would fail the TLS handshake without this.
+// sharedTransport reuses a single connection pool across all outbound requests
+// instead of allocating a new Transport (and leaking idle connections) per call.
+// Proxy environment variables are resolved dynamically per request so runtime
+// or test overrides take effect immediately while local origins stay direct.
+var (
+	sharedTransport = planTransport()
+	sharedHTTP      = &http.Client{Transport: sharedTransport, Timeout: httpTimeout}
+)
+
+// apiClient reaches Mistral and CPA's own management API with a shared
+// transport and bounded timeout.
 func apiClient() *http.Client {
-	return &http.Client{Transport: planTransport(), Timeout: 0}
+	return sharedHTTP
 }
 
 // planTransport honours the proxy the operator configured, but keeps loopback
 // and private origins direct: those are CPA itself or a LAN deployment, which a
 // public-facing proxy cannot resolve.
 func planTransport() *http.Transport {
-	proxyURL := firstNonEmpty(
-		os.Getenv("VIBE_PLAN_PROXY"),
-		os.Getenv("HTTPS_PROXY"),
-		os.Getenv("https_proxy"),
-		os.Getenv("ALL_PROXY"),
-		os.Getenv("all_proxy"),
-	)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
 	transport.MaxIdleConnsPerHost = 4
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	if proxyURL == "" {
-		return transport
-	}
-	parsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return transport
-	}
 	transport.Proxy = func(req *http.Request) (*url.URL, error) {
-		if isLocalOrigin(req.URL.Hostname()) {
+		if req != nil && req.URL != nil && isLocalOrigin(req.URL.Hostname()) {
+			return nil, nil
+		}
+		proxyURL := firstNonEmpty(
+			os.Getenv("VIBE_PLAN_PROXY"),
+			os.Getenv("HTTPS_PROXY"),
+			os.Getenv("https_proxy"),
+			os.Getenv("ALL_PROXY"),
+			os.Getenv("all_proxy"),
+		)
+		if proxyURL == "" {
+			return nil, nil
+		}
+		parsed, err := url.Parse(proxyURL)
+		if err != nil {
 			return nil, nil
 		}
 		return parsed, nil
@@ -64,9 +70,12 @@ func isLocalOrigin(host string) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
-// insecureTransport is used only by tests that point at a self-signed server.
-func insecureTransport() *http.Transport {
-	transport := planTransport()
-	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test only
-	return transport
+// isLoopbackOrigin reports whether host is strictly a loopback address.
+func isLoopbackOrigin(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

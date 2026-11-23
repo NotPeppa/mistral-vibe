@@ -67,3 +67,28 @@ func TestUsageMetricsSeparateLabelFromValue(t *testing.T) {
 		t.Fatal("the old inline label markup is back")
 	}
 }
+
+func TestFillPageIsSinglePass(t *testing.T) {
+	out := string(fillPage(map[string]string{
+		"plan": "{{note}}",
+		"note": "INJECTED_RAW_HTML",
+	}))
+	if strings.Contains(out, `<div class="value">INJECTED_RAW_HTML</div>`) {
+		t.Fatal("fillPage performed multi-pass substitution")
+	}
+	if !strings.Contains(out, `<div class="value">{{note}}</div>`) {
+		t.Fatal("expected literal placeholder value in plan slot")
+	}
+}
+
+func TestPageHintUsesActualConfigPluginID(t *testing.T) {
+	configure([]byte("enabled: true\n"))
+	defer configure(nil)
+	resp, err := pageHandler{}.HandleManagement(context.Background(), pluginapi.ManagementRequest{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("page: %v", err)
+	}
+	if !strings.Contains(string(resp.Body), "plugins.configs.cpa-mistral-vibe") {
+		t.Fatal("page hint does not name plugins.configs.cpa-mistral-vibe")
+	}
+}

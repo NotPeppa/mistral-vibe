@@ -62,8 +62,40 @@ gateway:
 	if !strings.Contains(merged, "gateway:") {
 		t.Fatalf("following block lost:\n%s", merged)
 	}
+	if !strings.Contains(merged, "Someone Else") || !strings.Contains(merged, "https://other.example/v1") {
+		t.Fatalf("existing provider was wiped out:\n%s", merged)
+	}
 	if !strings.Contains(merged, "Mistral Vibe") {
 		t.Fatalf("entry missing:\n%s", merged)
+	}
+	// Updating Mistral Vibe must keep "Someone Else" intact too.
+	updated, changed2 := mergeCompatEntry(merged, "https://api.mistral.ai", "mstrl_k2", []string{"a", "b"})
+	if !changed2 {
+		t.Fatal("expected update on key change")
+	}
+	if !strings.Contains(updated, "Someone Else") || !strings.Contains(updated, "mstrl_k2") || strings.Contains(updated, `"mstrl_k"`) {
+		t.Fatalf("update broke existing providers:\n%s", updated)
+	}
+	// Idempotent after update.
+	if _, changed3 := mergeCompatEntry(updated, "https://api.mistral.ai", "mstrl_k2", []string{"a", "b"}); changed3 {
+		t.Fatalf("third merge should be idempotent:\n%s", updated)
+	}
+}
+
+func TestMergeCompatEntryAtLineZeroAndTrailingV1(t *testing.T) {
+	config := "openai-compatibility: []\nport: 8317\n"
+	merged, changed := mergeCompatEntry(config, "https://api.mistral.ai/v1", "mstrl_k", []string{"a"})
+	if !changed {
+		t.Fatal("expected a change")
+	}
+	if strings.HasPrefix(merged, "\n") {
+		t.Fatalf("spurious leading newline:\n%q", merged)
+	}
+	if strings.Contains(merged, "/v1/v1") {
+		t.Fatalf("double /v1 suffix:\n%s", merged)
+	}
+	if !strings.Contains(merged, `"https://api.mistral.ai/v1"`) {
+		t.Fatalf("missing normalized base-url:\n%s", merged)
 	}
 }
 

@@ -299,20 +299,25 @@ func run(h *handle) bool {
 	check("balance reports the month", contains(balanceBody, `"balance"`) && contains(balanceBody, "USD"), balanceBody)
 
 	fmt.Println("[11] plugin page")
-	pageReq, _ := json.Marshal(map[string]any{"method": "GET", "path": "/", "headers": map[string][]string{}, "query": map[string][]string{}})
+	pageReq, _ := json.Marshal(map[string]any{"method": "GET", "path": "/v0/resource/plugins/cpa-mistral-vibe/page", "headers": map[string][]string{}, "query": map[string][]string{}})
 	page, err := h.invoke("management.handle", pageReq)
 	check("page route answers", err == nil, errText(err))
-	// The page must arrive rendered: a resource route has no management auth, so
-	// it cannot fetch the balance itself.
-	pageBody := decodeBody(fieldOf(page, "Body"))
-	if pageBody == "" {
-		pageBody = string(page)
+	// The page must arrive rendered as HTML: a resource route has no management
+	// auth, so it cannot fetch the balance itself.
+	var pageResp struct {
+		StatusCode int
+		Body       string
 	}
-	if len(pageBody) < 200 {
-		pageBody += strings.Repeat(" ", 200-len(pageBody))
+	_ = json.Unmarshal(page, &pageResp)
+	pageBody := decodeBody(pageResp.Body)
+	preview := pageBody
+	if len(preview) > 200 {
+		preview = preview[:200]
 	}
-	check("page has no unrendered placeholder", !contains(pageBody, "{{"), pageBody[:200])
-	check("page shows the configured key source", contains(pageBody, "api_key"), pageBody[:200])
+	check("page status 200", pageResp.StatusCode == 200, fmt.Sprint(pageResp.StatusCode))
+	check("page renders HTML", contains(pageBody, "<!doctype html>"), preview)
+	check("page has no unrendered placeholder", !contains(pageBody, "{{"), preview)
+	check("page shows the configured key source", contains(pageBody, "cpa-mistral-vibe") && contains(pageBody, "api_key"), preview)
 
 	fmt.Println("[12] unknown method")
 	_, err = h.invoke("nope.nope", []byte("{}"))

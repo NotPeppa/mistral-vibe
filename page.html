@@ -106,7 +106,7 @@
   @media (prefers-reduced-motion: reduce) { .meter > i, button { transition: none; } }
 
   /* ---------- detail table ---------- */
-  .panel { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+  .panel { background: var(--surface); border: 1px solid var(--line-soft); border-radius: var(--radius); box-shadow: var(--shadow); overflow-x: auto; }
   .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line-soft); flex-wrap: wrap; }
   .panel-head h2 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -.01em; }
   .tabs { display: flex; gap: 6px; }
@@ -126,7 +126,7 @@
     grid-template-columns: minmax(180px, 1.5fr) 70px 80px 80px 80px 80px 80px 84px 70px 80px;
   }
   @media (max-width: 1080px) {
-    .row-head.usage-row, .row.usage-row { grid-template-columns: minmax(140px, 1.4fr) repeat(4, 64px) 70px; }
+    .row-head.usage-row, .row.usage-row { grid-template-columns: minmax(140px, 1.4fr) repeat(5, 64px) 70px; }
     .row-head.usage-row > :nth-child(n+7):not(:last-child),
     .row.usage-row > :nth-child(n+7):not(:last-child) { display: none; }
   }
@@ -143,6 +143,8 @@
   .name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .thin-bar { height: 5px; border-radius: 999px; background: var(--track); overflow: hidden; }
   .thin-bar > i { display: block; height: 100%; border-radius: 999px; background: var(--ok); }
+  .thin-bar.warn > i { background: var(--warn); }
+  .thin-bar.bad > i { background: var(--bad); }
   .total { display: flex; align-items: center; justify-content: space-between; padding: 13px 20px; background: var(--surface-2); border-top: 1px solid var(--line-soft); font-size: 13px; }
   .total .k { color: var(--text-2); }
 
@@ -229,8 +231,8 @@
     <div class="card highlight">
       <div class="head"><span>本月剩余</span></div>
       <div class="value">{{remain}}<span class="unit">{{unit}}</span></div>
-      <div class="meter {{barTone}}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{barPct}}" aria-label="本月额度已用">
-        <i style="width:{{barPct}}%"></i>
+      <div class="meter{{barTone}}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{barWidth}}" aria-label="本月额度已用">
+        <i style="width:{{barWidth}}%"></i>
       </div>
       <div class="foot">{{barPct}}% 已用{{paygText}}</div>
     </div>
@@ -265,7 +267,7 @@
       <span class="k">{{rowCount}}</span>
       <span class="muted">
         合计 <span class="num strong">{{spent}}</span> / <span class="num">{{limit}}</span>
-        <span class="pill ok" style="margin-left:10px">{{barPct}}%</span>
+        <span class="pill {{planTone}}" style="margin-left:10px">{{barPct}}%</span>
       </span>
     </div>
   </section>
@@ -353,15 +355,23 @@ async function connect() {
       headers: { 'Content-Type': 'application/json', 'X-Management-Key': mgmt, Authorization: 'Bearer ' + mgmt },
       body: JSON.stringify({ plan_key: key, api_key: key, base_url: base }),
     });
-    const data = await resp.json();
+    const text = await resp.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch {}
     const box = $('result');
     if (!resp.ok) {
       box.style.display = 'flex';
       box.className = 'notice bad';
-      box.textContent = data.error || ('失败：HTTP ' + resp.status);
+      box.textContent = data.error || text.trim() || ('失败：HTTP ' + resp.status);
       return setStatus('');
     }
     const p = data.provider;
+    if (!p) {
+      box.style.display = 'flex';
+      box.className = 'notice bad';
+      box.textContent = '响应格式异常：缺少 provider 字段';
+      return setStatus('');
+    }
     box.style.display = 'flex';
     box.className = 'notice ok';
     box.textContent = (p.created ? '已添加' : '已更新') + '「' + p.name + '」，' + p.models.length + ' 个模型。刷新「AI 提供商」页即可看到。';

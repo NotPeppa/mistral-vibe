@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"sync"
 	"testing"
 )
 
@@ -66,4 +67,57 @@ func TestRegistrationConfigDecodesBase64(t *testing.T) {
 	if got := registrationConfig([]byte(`{}`)); len(got) != 0 {
 		t.Fatalf("got %q", got)
 	}
+}
+
+func TestParseFlatYAMLSkipsNestedAndPreservesHashInQuotes(t *testing.T) {
+	block := `api_key: "mstrl_val#notcomment" # trailing comment
+store:
+  api_key: nested_should_be_ignored
+  model: nested_model
+model: top_model
+`
+	values := parseFlatYAML(block)
+	if values["api_key"] != "mstrl_val#notcomment" {
+		t.Fatalf("api_key = %q", values["api_key"])
+	}
+	if values["model"] != "top_model" {
+		t.Fatalf("model = %q", values["model"])
+	}
+}
+
+func TestApplyConfigFileReadsJSON(t *testing.T) {
+	var cfg pluginConfig
+	applyConfigFile(&cfg, []byte(`{"api_key":"mstrl_from_json","base_url":"https://api.mistral.ai","plan_path":"/custom/whoami"}`))
+	if cfg.apiKey != "mstrl_from_json" || cfg.baseURL != "https://api.mistral.ai" || cfg.planPath != "/custom/whoami" {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+}
+
+func TestConfigureClearsRemovedKeyAndIsRaceSafe(t *testing.T) {
+	t.Setenv("VIBE_API_KEY", "")
+	t.Setenv("MISTRAL_API_KEY", "")
+	configure([]byte("api_key: mstrl_first\n"))
+	if got := currentConfig().apiKey; got != "mstrl_first" {
+		t.Fatalf("got %q", got)
+	}
+	// Reconfiguring without api_key must clear the previous key.
+	configure([]byte("enabled: true\n"))
+	if got := currentConfig().apiKey; got != "" {
+		t.Fatalf("expected cleared key, got %q", got)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			configure([]byte("api_key: mstrl_concurrent\n"))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = currentConfig()
+		}()
+	}
+	wg.Wait()
+	configure(nil)
 }
