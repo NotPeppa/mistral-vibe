@@ -59,7 +59,7 @@ var buildVersion = pluginVer
 
 const (
 	pluginName   = "Mistral Vibe Token Plan"
-	pluginVer    = "0.2.4"
+	pluginVer    = "0.3.0"
 	pluginAuthor = "NotPeppa"
 	pluginRepo   = "https://github.com/NotPeppa/mistral-vibe"
 	// pluginID is the management route prefix and provider key.
