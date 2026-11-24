@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -17,7 +18,7 @@ const realBudget = `{
   "reset_at":"2026-12-01T00:00:00Z"}`
 
 func TestReadBudgetVibeKeySpendsVibeBudget(t *testing.T) {
-	month, ok, err := readBudget([]byte(realBudget), "chat", nil)
+	month, ok, err := readBudget([]byte(realBudget), scopeVibe, nil)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
@@ -36,7 +37,7 @@ func TestReadBudgetVibeKeySpendsVibeBudget(t *testing.T) {
 }
 
 func TestReadBudgetAPIKeySpendsAPIBudget(t *testing.T) {
-	month, ok, err := readBudget([]byte(realBudget), "api", nil)
+	month, ok, err := readBudget([]byte(realBudget), scopeAPI, nil)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
@@ -47,14 +48,14 @@ func TestReadBudgetAPIKeySpendsAPIBudget(t *testing.T) {
 }
 
 func TestReadBudgetUnknownKindHasNoCard(t *testing.T) {
-	if _, ok, err := readBudget([]byte(realBudget), "", nil); ok || err != nil {
+	if _, ok, err := readBudget([]byte(realBudget), scopeUnknown, nil); ok || err != nil {
 		t.Fatalf("ok=%v err=%v: an unknown kind must not claim a budget", ok, err)
 	}
 }
 
 func TestReadBudgetZeroBudgetHasNoCard(t *testing.T) {
 	body := `{"vibe_budget":{"usage_percentage":10,"initial_budget":0,"currency":"USD"}}`
-	if _, ok, err := readBudget([]byte(body), "chat", nil); ok || err != nil {
+	if _, ok, err := readBudget([]byte(body), scopeVibe, nil); ok || err != nil {
 		t.Fatalf("ok=%v err=%v: a zero budget has no card", ok, err)
 	}
 }
@@ -62,7 +63,7 @@ func TestReadBudgetZeroBudgetHasNoCard(t *testing.T) {
 func TestReadBudgetHonoursPayg(t *testing.T) {
 	on := true
 	body := `{"vibe_budget":{"usage_percentage":120,"initial_budget":150,"currency":"USD","payg_enabled":true}}`
-	month, ok, err := readBudget([]byte(body), "chat", nil)
+	month, ok, err := readBudget([]byte(body), scopeVibe, nil)
 	if err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
 	}
@@ -77,7 +78,8 @@ func TestReadBudgetHonoursPayg(t *testing.T) {
 
 func TestApplyBudgetBecomesTheBalance(t *testing.T) {
 	plan := &planResponse{Plan: "Student", Tier: "CHAT"}
-	plan.applyBudget(budgetWindow{Name: "Month", UsedPct: 5.6684, Limit: 150, Spent: 8.5, Unit: "USD", ResetAt: "2026-12-01T00:00:00Z"})
+	plan.applyBudget(budgetSegment{Scope: "vibe", Billing: true, Window: budgetWindow{
+		Name: "Month", UsedPct: 5.6684, Limit: 150, Spent: 8.5, Unit: "USD", ResetAt: "2026-12-01T00:00:00Z"}})
 	if !plan.HasBalance || plan.Unit != "USD" {
 		t.Fatalf("plan = %+v", plan)
 	}
@@ -110,4 +112,108 @@ func TestKeyKindFromWhoami(t *testing.T) {
 
 func unmarshalForTest(raw string, target any) error {
 	return jsonUnmarshal([]byte(raw), target)
+}
+
+// The 2026-12-01 cycle: a harness request bills the API half, so the balance is
+// the 15 USD API allowance, and the untouched Vibe allowance is still shown.
+func TestHarnessTrafficBillsAPIBudgetAndShowsVibeBesideIt(t *testing.T) {
+	segments, err := readBudgets([]byte(realBudget), scopeAPI, scopeVibe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 2 {
+		t.Fatalf("segments = %+v", segments)
+	}
+	if !segments[0].Billing || segments[0].Window.Limit != 15 || segments[0].Name != "API allowance" {
+		t.Fatalf("billing segment = %+v", segments[0])
+	}
+	if segments[1].Window.Limit != 150 || segments[1].Scope != "vibe" {
+		t.Fatalf("vibe segment = %+v", segments[1])
+	}
+
+	plan := &planResponse{Plan: "Student", Tier: "CHAT"}
+	plan.applyBudget(segments...)
+	if plan.BilledScope != "api" || plan.Limit != 15 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	if len(plan.Windows) != 2 || plan.Windows[0].Window != "API · Month" || plan.Windows[1].Window != "Month" {
+		t.Fatalf("windows = %+v", plan.Windows)
+	}
+}
+
+func TestReadBudgetsDoesNotRepeatOneHalf(t *testing.T) {
+	segments, err := readBudgets([]byte(realBudget), scopeAPI, scopeAPI, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 {
+		t.Fatalf("segments = %+v: one half must be one card", segments)
+	}
+}
+
+func TestResolveScope(t *testing.T) {
+	cases := []struct {
+		name                  string
+		override, split, kind string
+		outsideAPI            bool
+		want                  billingScope
+	}{
+		{"config override wins", "vibe", "api", "chat", true, scopeVibe},
+		{"mistral's split beats the kind", "", "api", "chat", false, scopeAPI},
+		{"mistral's split says vibe", "", "vibe", "api", true, scopeVibe},
+		{"chat key through a harness bills api", "", "", "CHAT", true, scopeAPI},
+		{"chat key pre-rollout bills vibe", "", "", "CHAT", false, scopeVibe},
+		{"api key always bills api", "", "", "API", false, scopeAPI},
+		{"unknown kind has no card", "", "", "", true, scopeUnknown},
+	}
+	for _, c := range cases {
+		if got := resolveScope(c.override, c.split, c.kind, c.outsideAPI); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// The point of impersonating the CLI: when Mistral answers that the key is
+// scoped to CLI usage, a chat key through this plugin reports the Vibe month
+// again — the 150 USD half — and the banner says why.
+func TestCLIScopingPutsTheVibeAllowanceBack(t *testing.T) {
+	scope := resolveScope("", "cli", "chat", true)
+	if scope != scopeVibe {
+		t.Fatalf("scope = %q, a cli scoping answer must spend the Vibe allowance", scope)
+	}
+	segments, err := readBudgets([]byte(realBudget), scope, scopeVibe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := &planResponse{Plan: "Student", Tier: "CHAT"}
+	plan.applyBudget(segments...)
+	if plan.BilledScope != "vibe" || plan.Limit != 150 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	if plan.Balance < 141 || plan.Balance > 142 {
+		t.Fatalf("balance = %v, want the Vibe month's remainder", plan.Balance)
+	}
+	banner := renderCLI(plan, "mistral-vibe-cli-latest")
+	if !strings.Contains(banner, "billing Vibe allowance (Mistral products)") {
+		t.Fatalf("banner:\n%s", banner)
+	}
+}
+
+func TestScopeEvidenceNeverOverclaims(t *testing.T) {
+	chatPlan := func(scope billingScope) *planResponse {
+		plan := &planResponse{Plan: "Student", Tier: "CHAT"}
+		segments, _ := readBudgets([]byte(realBudget), scope, scopeVibe, nil)
+		plan.applyBudget(segments...)
+		return plan
+	}
+	setAmbient(ambientNote{Mode: "vibe_cli", Scope: "vibe"})
+	if got := ambientSummary(chatPlan(scopeVibe)); !strings.Contains(got, "确认走 Vibe 额度") {
+		t.Fatalf("vibe case = %q", got)
+	}
+	setAmbient(ambientNote{Mode: "vibe_cli", Scope: "api"})
+	got := ambientSummary(chatPlan(scopeAPI))
+	if !strings.Contains(got, "仍按 API 额度") {
+		t.Fatalf("api case = %q: the page must not claim a success the billing read denies", got)
+	}
+	setAmbient(ambientNote{})
 }

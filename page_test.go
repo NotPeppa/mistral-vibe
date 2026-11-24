@@ -92,3 +92,25 @@ func TestPageHintUsesActualConfigPluginID(t *testing.T) {
 		t.Fatal("page hint does not name plugins.configs.cpa-mistral-vibe")
 	}
 }
+
+func TestPageNamesTheBilledHalf(t *testing.T) {
+	// A harness bills the API allowance from the 2026-12-01 cycle: both cards
+	// exist, and the page says which one the traffic lands on instead of
+	// presenting the untouched Vibe month as the balance.
+	plan := &planResponse{Plan: "Student", Tier: "CHAT"}
+	segments, err := readBudgets([]byte(realBudget), scopeAPI, scopeVibe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.applyBudget(segments...)
+	view := map[string]string{"billing": scopeLabel(plan.BilledScope), "planFoot": "计费：API 额度 · 非 Mistral 产品用量"}
+	if view["billing"] != "API allowance (outside-tool usage)" {
+		t.Fatalf("billing = %q", view["billing"])
+	}
+	if got := windowTier(plan, plan.Windows[0]); got != "CHAT" {
+		t.Fatalf("billed window tier = %q", got)
+	}
+	if got := windowTier(plan, plan.Windows[1]); got != "CHAT · vibe" {
+		t.Fatalf("beside window tier = %q: the other half must be labelled", got)
+	}
+}

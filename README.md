@@ -119,6 +119,10 @@ http://127.0.0.1:8317/v0/resource/plugins/cpa-mistral-vibe/page
 | `base_url` | Mistral 地址，默认 `https://api.mistral.ai` |
 | `plan_base` | 读计划的 console 地址，默认 `https://console.mistral.ai` |
 | `model` | 余额横幅上显示的模型名 |
+| `scope` | 强制这个插件花哪一半：`api` / `vibe`；留空按 Mistral 的回答和 key 类型决定 |
+| `outside_scope` | Le Chat 计划 key 走「非 Mistral 产品」时花哪一半，默认 `api`（2026-12-01 起） |
+| `vibe_cli` | 默认 `on`：发布的提供商条目带 Vibe CLI 的请求特征（`X-Cli-Scoping: cli`、CLI 客户端名与 UA），让 CPA 的流量被记到 Vibe 额度；`passthrough` 关掉 |
+| `headers` | 附加请求头，`X-Foo: bar; X-Baz: qux`；覆盖在 CLI 默认值之上，空值表示去掉某个默认头 |
 
 ### 从源码编译（可选）
 
@@ -187,7 +191,76 @@ GET console.mistral.ai/api/vibe/whoami       → 这个 key 花哪一半预算
                 "currency":"USD","reset_at":"2026-12-01T00:00:00Z","payg_enabled":false}}
 ```
 
-### 关键：预算属于组织，花哪一半取决于 key 的类型
+### 关键：预算属于组织，花哪一半取决于 key 的**类型**和**来的地方**
+
+从 **2026-12-01 那个账期**起，Mistral 把两条额度拆得更细了：
+
+| 请求来自 | 花哪一半 | 窗口名 |
+| --- | --- | --- |
+| Mistral 自家产品（Vibe CLI、Le Chat） | `vibe_budget`（专属 Vibe 额度） | `Month` |
+| **非 Mistral 产品**（CPA、Claude Code、任何第三方 harness） | `api_budget`（套餐自带的通用 API 额度） | `API · Month` |
+| 控制台建的 Studio key | `api_budget` | `API · Month` |
+
+**这个插件默认不认第二行。** 它发布的提供商条目会带上 Vibe CLI 自己的请求特征，
+让 Mistral 把 CPA 转发出去的流量当成 CLI 用量，从而继续花 `vibe_budget`（见下一节
+「模拟 Vibe CLI」）。把 `vibe_cli` 设成 `passthrough` 才是第二行那个行为：余额卡
+显示 `api_budget`。
+
+选择顺序是：`scope` 配置 → Mistral 自己的 scoping 回答（`scoping_cli` /
+`X-Cli-Scoping`）→ key 类型（`chat` 走 `outside_scope`，默认 `api`；`api` 永远走
+`api_budget`）。计划和余额两个窗口都会显示，另一半点在「额度明细」里带
+`· vibe` 标记 —— 不花钱的那一半留着，是因为它才是「为什么余额和我以为的不一样」
+的答案。
+
+如果某个账号的合同仍按老口径计费，把 `outside_scope: vibe`（或 `scope: vibe`）
+填回去即可，读的就是 `vibe_budget`。
+
+### 模拟 Vibe CLI：让 CPA 的流量继续花 Vibe 额度
+
+计费口径认的是**请求怎么自称**，不是谁开的 socket。所以插件把 Vibe CLI 的自我介绍
+写给 CPA 的那条 `openai-compatibility` 条目，CPA 转发时原样带上：
+
+```yaml
+openai-compatibility:
+  - name: "Mistral Vibe"
+    base-url: "https://api.mistral.ai/v1"
+    api-key-entries:
+      - api-key: "mstrl_..."
+    headers:
+      Accept: "application/json"
+      Accept-Encoding: "identity"
+      User-Agent: "mistral-vibe-cli/0.1"
+      X-Cli-Scoping: "cli"
+      X-Mistral-Client: "vibe-cli"
+    models: ...
+```
+
+三件事一起做才像：
+
+| 项 | 值 | 作用 |
+| --- | --- | --- |
+| `X-Cli-Scoping` | `cli` | CLI 自己的记账开关：把这次请求算成 CLI 用量 |
+| `User-Agent` | `mistral-vibe-cli/0.1` | 客户端自报 |
+| `X-Mistral-Client` | `vibe-cli` | 客户端标签 |
+
+**刻意没做的**：CLI 内部的 cookie/会话路径、`console` 的计划接口、账号自己的组织
+id。那些是账号管道而不是请求特征 —— 它标识的是「哪个会话」而不是「什么客户端」，
+写进去只会在 CLI 轮换它的时候失效，还会把别处的会话带进来。请求特征这三项是声明性的、
+跟着请求走的，所以留在这里。
+
+验证方式不是猜的：插件在 `/v1/billing/subscription` 里读回 `scoping_cli`，页面和
+`/render` 横幅会把两边对上或对不上都说出来：
+
+```
+billing API allowance (outside-tool usage)      ← 计费那一半
+模拟 Vibe CLI 已发出 · billing 仍按 API 额度     ← 没被认可
+模拟 Vibe CLI 生效 · billing 确认走 Vibe 额度    ← 被认可
+```
+
+只有当 `billed_scope` 真是 `vibe` 时才写「生效」。没读回 `scoping_cli`（Mistral 的
+响应里没有这个字段）时，按默认口径记账，页面不会替它宣布成功。
+
+### key 的类型（`whoami` 的 `plan_type`）
 
 magpie 踩过这个坑（issue #5741）：**同一组织的每个 key 看到的是同样的两个预算**，
 所以必须先用 whoami 的 `plan_type` 判断这个 key 花哪一半：
@@ -197,7 +270,8 @@ magpie 踩过这个坑（issue #5741）：**同一组织的每个 key 看到的�
 | Le Chat 计划 key（Pro/Student/Team） | `chat` | `vibe_budget` | `Month` |
 | 控制台建的 Studio key | `api` | `api_budget` | `API · Month` |
 
-不看类型直接读 `vibe_budget`，会给 Studio key 显示它根本不会花的 Vibe 月额度。
+不看类型直接读 `vibe_budget`，会给 Studio key 显示它根本不会花的 Vibe 月额度；
+不看「来的地方」直接读 `vibe_budget`，会给这个插件显示它同样花不到的 Vibe 月额度。
 
 ### 实测输出
 
@@ -206,8 +280,10 @@ Mistral Vibe token plan
 model   mistral-vibe-cli-latest
 plan    Student
 tier    CHAT
-balance 139.36 USD
-usage   Month            ▍      7% used · resets 2026-12-01T00:00:00Z
+billing API allowance (outside-tool usage)
+balance 14.99 USD
+usage   API · Month            0.0% used · resets 2026-12-01T00:00:00Z
+usage   Month (vibe)    ▍      5.7% used · resets 2026-12-01T00:00:00Z
 ```
 
 计划名同时保留 whoami 的 id（`EDU`/`FREE`）和 billing 的显示名（`Student`/`Pro`/`Team`），
@@ -307,6 +383,14 @@ MISTRAL_API_KEY=mstrl_... ./tests/e2e.sh         # 52 项，多出真 key 的余
 
 - **不会新增提供商「卡片」**：只能写 `openai-compatibility` 列表项，理由见上。
 - **余额是当月预算**：`/v1/billing/budget` 给的是组织月预算，同组织多个 key 数字相同。
+- **余额是「这个插件花的」那一半**：第三方 harness 的用量计 `api_budget`，所以
+  余额卡上是通用 API 额度。想强制看另一半个把 `scope` 设上去，但那个数字不是
+  这里花掉的。
+- **Free 套餐从 2026-12-01 起没有免费 API 额度**：`api_budget` 为 0 时没有余额卡
+  （0 额度不画卡），页面会退到速率额度那条兜底路径。
+- **模拟 CLI 是请求特征，不是承诺**：`X-Cli-Scoping` 是否被认，只有 Mistral 说了算。
+  插件读回 `scoping_cli` 和 `billed_scope` 如实显示，同时列出两个额度窗口，所以
+  「以为在花 Vibe 的、实际花的是 API 的」这件事一眼能看出来。
 - 余额与模型调用在 CPA 里是**两处配置**：AI 提供商那条让 CPA 能调用，
   QuotaProvider 让面板能显示余额。它们读的是同一个 key。
 - 写 AI 提供商需要 CPA 的 Management Key；页面会复用面板会话，取不到时明确报错。

@@ -22,6 +22,23 @@ type pluginConfig struct {
 	planBase string
 	planPath string
 	model    string
+	// scope forces which half of the plan this plugin's traffic bills:
+	// "api" (the general API allowance), "vibe" (the dedicated Vibe allowance)
+	// or empty to let Mistral's own answer and the key kind decide.
+	scope string
+	// outsideScope is what a chat key spends when it reaches Mistral through a
+	// third-party tool: "api" since the SCOPING_CLI rollout (2026-12-01 cycle),
+	// "vibe" to restore the pre-rollout accounting on an account that keeps it.
+	outsideScope string
+	// vibeCLI makes the published provider entry carry the Vibe CLI's own
+	// presentation (client label, user agent, X-Cli-Scoping), which is what asks
+	// Mistral to book this traffic as Vibe CLI usage. "passthrough" sends CPA's
+	// own headers instead; empty means on.
+	vibeCLI string
+	// headers are extra request headers for the published entry, in config
+	// syntax ("X-Foo: bar; X-Baz: qux"), merged over the Vibe CLI defaults. An
+	// empty value removes a default header.
+	headers map[string]string
 }
 
 var (
@@ -52,6 +69,27 @@ func applyConfigMap(cfg *pluginConfig, values map[string]string) {
 	cfg.planBase = firstNonEmpty(values["plan_base"], cfg.planBase)
 	cfg.planPath = firstNonEmpty(values["plan_path"], cfg.planPath)
 	cfg.model = firstNonEmpty(values["model"], cfg.model)
+	cfg.vibeCLI = firstNonEmpty(values["vibe_cli"], values["cli_scope"], cfg.vibeCLI)
+	if raw := firstNonEmpty(values["headers"], values["header"]); raw != "" {
+		if parsed := parseHeaderList(raw); len(parsed) > 0 {
+			cfg.headers = parsed
+		}
+	}
+	cfg.scope = firstNonEmpty(values["scope"], values["budget_scope"], cfg.scope)
+	cfg.outsideScope = firstNonEmpty(values["outside_scope"], values["third_party_scope"], cfg.outsideScope)
+}
+
+// scopeOrDefault is the configured scope, already parsed; empty means "decide
+// from Mistral's answer and the key kind".
+func (c pluginConfig) scopeOrDefault() billingScope { return parseScope(c.scope) }
+
+// outsideScopeOrDefault is what a chat key spends through this plugin: the API
+// allowance unless the operator says this account still bills the Vibe one.
+func (c pluginConfig) outsideScopeOrDefault() billingScope {
+	if scope := parseScope(c.outsideScope); scope != scopeUnknown {
+		return scope
+	}
+	return scopeAPI
 }
 
 // applyConfigFile parses a fallback config file, supporting both JSON (such as
@@ -169,13 +207,39 @@ func parseYAMLScalar(raw string) string {
 	return strings.TrimSpace(raw)
 }
 
+// parseHeaderList reads "Name: value" pairs separated by ; or newlines — the
+// shape a one-line YAML value and the panel's text field both allow. A bare name
+// clears that header from the Vibe CLI defaults.
+func parseHeaderList(raw string) map[string]string {
+	out := map[string]string{}
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == ';' || r == '\n' }) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, _ := strings.Cut(part, ":")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		out[name] = strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return out
+}
+
 func loadBaseConfig() pluginConfig {
 	cfg := pluginConfig{
-		apiKey:   envOr("VIBE_API_KEY", envOr("MISTRAL_API_KEY", "")),
-		baseURL:  envOr("VIBE_API_BASE", ""),
-		planBase: envOr("VIBE_PLAN_BASE", ""),
-		planPath: envOr("VIBE_PLAN_PATH", ""),
-		model:    envOr("VIBE_MODEL", ""),
+		apiKey:       envOr("VIBE_API_KEY", envOr("MISTRAL_API_KEY", "")),
+		baseURL:      envOr("VIBE_API_BASE", ""),
+		planBase:     envOr("VIBE_PLAN_BASE", ""),
+		planPath:     envOr("VIBE_PLAN_PATH", ""),
+		model:        envOr("VIBE_MODEL", ""),
+		scope:        envOr("VIBE_BUDGET_SCOPE", ""),
+		outsideScope: envOr("VIBE_OUTSIDE_SCOPE", ""),
+		vibeCLI:      envOr("VIBE_CLI_MODE", ""),
+	}
+	if raw := envOr("VIBE_CLI_HEADERS", ""); raw != "" {
+		cfg.headers = parseHeaderList(raw)
 	}
 	if path := configPath(); path != "" {
 		if raw, err := os.ReadFile(path); err == nil {
@@ -254,4 +318,23 @@ func (c pluginConfig) baseUrl() string {
 // planBaseOrDefault is the console host the plan is read from.
 func (c pluginConfig) planBaseOrDefault() string {
 	return firstNonEmpty(c.planBase, defaultPlanBase)
+}
+
+// vibeCLIOn reports whether the Vibe CLI presentation is enabled. It is the
+// default: traffic that does not look like a Mistral product is booked to the
+// API allowance, which is the half this plugin cannot otherwise spend.
+func (c pluginConfig) vibeCLIOn() bool {
+	switch strings.ToLower(strings.TrimSpace(c.vibeCLI)) {
+	case "passthrough", "off", "none", "false":
+		return false
+	}
+	return true
+}
+
+// providerHeaders are the headers the published provider entry carries.
+func (c pluginConfig) providerHeaders() map[string]string {
+	if !c.vibeCLIOn() {
+		return ambientHeaders("passthrough", c.headers)
+	}
+	return ambientHeaders("vibe_cli", c.headers)
 }

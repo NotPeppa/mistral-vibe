@@ -132,6 +132,10 @@ func pluginDescriptor() []byte {
 					{"Name": "base_url", "Type": "string", "Default": defaultAPIBase, "Description": "Mistral base URL for the provider entry."},
 					{"Name": "plan_base", "Type": "string", "Default": defaultPlanBase, "Description": "Vibe console base URL used for the plan read."},
 					{"Name": "model", "Type": "string", "Default": modelVibe, "Description": "Model shown on the balance banner."},
+					{"Name": "scope", "Type": "string", "Default": "", "Description": "Which half of the plan this plugin's traffic bills: api (the API allowance, default from the 2026-12-01 cycle), vibe (the dedicated Vibe allowance), or empty to follow Mistral's answer and the key kind."},
+					{"Name": "outside_scope", "Type": "string", "Default": "api", "Description": "What a Le Chat plan key spends when it reaches Mistral through this plugin. api is the 2026-12-01 default; vibe restores the old accounting for an account that keeps it."},
+					{"Name": "vibe_cli", "Type": "string", "Default": "on", "Description": "Publish the provider entry with the Vibe CLI's own presentation (X-Cli-Scoping: cli, the CLI client label and user agent), so Mistral books CPA's traffic against the plan's Vibe allowance. passthrough sends CPA's headers instead."},
+					{"Name": "headers", "Type": "string", "Default": "", "Description": "Extra request headers for the published entry, e.g. \"X-Foo: bar; X-Baz: qux\". Merged over the Vibe CLI defaults; an empty value removes one."},
 				},
 			},
 			"capabilities": map[string]any{
@@ -583,6 +587,9 @@ type credential struct {
 	Unit    string  `json:"currency,omitempty"`
 	Expires string  `json:"expires_at,omitempty"`
 	Checked string  `json:"checked_at,omitempty"`
+	// Scope pins this credential's budget half: "api" or "vibe". Empty follows
+	// the config and Mistral's own answer.
+	Scope string `json:"scope,omitempty"`
 }
 
 func (c credential) Empty() bool { return c.PlanKey == "" && c.APIKey == "" }
@@ -768,7 +775,10 @@ type planResponse struct {
 	Limit   float64 `json:"limit,omitempty"`
 	ResetAt string  `json:"reset_at,omitempty"`
 	Payg    bool    `json:"payg,omitempty"`
-	raw     map[string]any
+	// BilledScope is the half of the plan these numbers come from: "api" for
+	// traffic through this plugin, "vibe" for the dedicated Mistral allowance.
+	BilledScope string `json:"billed_scope,omitempty"`
+	raw         map[string]any
 }
 
 type window struct {
@@ -776,6 +786,7 @@ type window struct {
 	Window    string  `json:"window"`
 	Remaining float64 `json:"remainingFraction"`
 	Reset     string  `json:"resetTime,omitempty"`
+	Scope     string  `json:"scope,omitempty"`
 }
 
 // /api/vibe/whoami is tried first because it is the endpoint that answers
@@ -825,11 +836,10 @@ func (c credential) readPlan(ctx context.Context) (*planResponse, error) {
 			if live != nil {
 				plan.attachRateLimits(live)
 			}
-			// whoami's plan_type says which budget this key spends; billing tells
-			// the month. Without a kind the org budget would be ambiguous.
-			if kind := keyKind(raw); kind != "" {
-				c.attachBudget(ctx, client, plan, kind)
-			}
+			// whoami's plan_type says which kind of key this is; billing tells the
+			// month. Which half it bills also depends on where the request comes
+			// from, because a harness is not a Mistral product.
+			c.attachBudget(ctx, client, plan, keyKind(raw))
 			return plan, nil
 		}
 	}
@@ -844,8 +854,17 @@ func (c credential) readPlan(ctx context.Context) (*planResponse, error) {
 }
 
 // attachBudget reads the plan's month from Mistral's billing API, the way
-// magpie and Vibe's own CLI do, and makes it the plan's balance.
+// magpie and Vibe's own CLI do, and makes the half this plugin bills the
+// plan's balance.
+//
+// From the 2026-12-01 cycle a request that reaches Mistral through a harness
+// (this plugin, Claude Code, any third-party coding tool) spends the general
+// API allowance, not the dedicated Vibe one, which stays with Mistral's own
+// products. The Vibe allowance is still read and shown beside it, so the page
+// says where the key's spending actually lands instead of naming a month this
+// traffic never touches.
 func (c credential) attachBudget(ctx context.Context, client *http.Client, plan *planResponse, kind string) {
+	// A credential may name its own budget half; the config covers the rest.
 	// One key reaches all three: whoami, billing and inference. A credential
 	// that names a separate inference key still bills on its plan key.
 	key := firstNonEmpty(c.PlanKey, c.APIKey)
@@ -856,32 +875,60 @@ func (c credential) attachBudget(ctx context.Context, client *http.Client, plan 
 	if err != nil {
 		return
 	}
-	window, ok, err := readBudget(budget, kind, nil)
-	if err != nil || !ok {
-		return
-	}
+	cfg := currentConfig()
+	override := firstNonEmpty(c.Scope, string(cfg.scopeOrDefault()))
 	var sub billingSubscription
 	if body, err := c.getJSONBody(ctx, client, c.billingURL(billingSubscriptionPath), key); err == nil {
-		if json.Unmarshal(body, &sub) == nil {
+		_ = json.Unmarshal(body, &sub)
+	}
+	scope := resolveScope(override, sub.ScopingCLI, kind, cfg.outsideScopeOrDefault() == scopeAPI)
+	segments, err := readBudgets(budget, scope, scopeVibe, nil)
+	if err != nil || len(segments) == 0 {
+		return
+	}
+	if sub.PlanName != "" || sub.PaygEnabled != nil || sub.VibePaygEnabled != nil {
+		for i := range segments {
 			payg := sub.VibePaygEnabled
-			if kind == "api" {
+			if billingScope(segments[i].Scope) == scopeAPI {
 				payg = sub.PaygEnabled
 			}
-			if again, okAgain, errAgain := readBudget(budget, kind, payg); errAgain == nil && okAgain {
-				window = again
+			if payg != nil {
+				segments[i].Window.Payg = *payg
 			}
-			// Keep whoami's own plan name and add billing's title beside it:
-			// "EDU" is the id, "Student" is what the app shows.
-			if title := planTitles[strings.ToUpper(strings.TrimSpace(sub.PlanName))]; title != "" {
-				if plan.Plan == "" || strings.EqualFold(plan.Plan, sub.PlanName) {
-					plan.Plan = title
-				} else {
-					plan.Tier = firstNonEmpty(plan.Tier, title)
-				}
+		}
+		// Keep whoami's own plan name and add billing's title beside it:
+		// "EDU" is the id, "Student" is what the app shows.
+		if title := planTitles[strings.ToUpper(strings.TrimSpace(sub.PlanName))]; title != "" {
+			if plan.Plan == "" || strings.EqualFold(plan.Plan, sub.PlanName) {
+				plan.Plan = title
+			} else {
+				plan.Tier = firstNonEmpty(plan.Tier, title)
 			}
 		}
 	}
-	plan.applyBudget(window)
+	plan.applyBudget(segments...)
+	// The evidence: what Mistral says it books this key's traffic against. A chat
+	// key billing the API half means the Vibe CLI presentation is not being
+	// honoured — better to say so than to show a Vibe card that never moves.
+	subRead := sub.PlanName != "" || sub.ScopingCLI != "" || sub.PaygEnabled != nil
+	mode := "passthrough"
+	if cfg.vibeCLIOn() {
+		mode = "vibe_cli"
+	}
+	note := ambientNote{Mode: mode, Scope: string(scope)}
+	switch {
+	case !subRead:
+		note.Evidence = "subscription unreadable"
+	case scope == scopeVibe:
+		note.Evidence = "billing agrees: this traffic spends the Vibe allowance"
+	case billingScope(parseScope(sub.ScopingCLI)) == scopeVibe:
+		note.Evidence = "Mistral scopes this key to the Vibe allowance"
+	case scope == scopeAPI && mode == "vibe_cli":
+		note.Evidence = "billing still books this traffic to the API allowance"
+	default:
+		note.Evidence = "billing books this traffic to the API allowance"
+	}
+	setAmbient(note)
 }
 
 // billingURL sits next to the inference host, so the same base that serves
@@ -1115,12 +1162,20 @@ func renderCLI(p *planResponse, model string) string {
 		if p.Tier != "" {
 			fmt.Fprintf(&b, "tier    %s\n", p.Tier)
 		}
+		if scope := scopeLabel(p.BilledScope); scope != "" {
+			fmt.Fprintf(&b, "billing %s\n", scope)
+		}
 		if p.HasBalance {
 			fmt.Fprintf(&b, "balance %s %s\n", trimFloat(p.Balance), p.Unit)
 		}
 		for _, w := range p.Windows {
 			used := clamp01(1-w.Remaining) * 100
 			label := firstNonEmpty(w.Window, "window")
+			if w.Scope != "" && !strings.EqualFold(w.Scope, p.BilledScope) {
+				// The other half: this traffic never spends it, but seeing it
+				// next to the billed one is what explains the difference.
+				label += " (" + w.Scope + ")"
+			}
 			// Sub-percent use would render as "0%" and hide a live signal; show
 			// one decimal below 1% so a fresh allowance still reads as measured.
 			amount := fmt.Sprintf("%d%%", int(used))
@@ -1152,6 +1207,19 @@ func trimFloat(v float64) string {
 		return "0"
 	}
 	return out
+}
+
+// scopeLabel names the half of the plan in one line the CLI and the page both
+// use: harness traffic bills the API allowance, Mistral's own apps bill the
+// dedicated Vibe one.
+func scopeLabel(scope string) string {
+	switch billingScope(scope) {
+	case scopeAPI:
+		return "API allowance (outside-tool usage)"
+	case scopeVibe:
+		return "Vibe allowance (Mistral products)"
+	}
+	return ""
 }
 
 func isCurrency(unit string) bool {

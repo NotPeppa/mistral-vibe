@@ -194,13 +194,16 @@ func run(h *handle) bool {
 		string(quota))
 	check("balance metric present", len(q.Summary) == 1 && q.Summary[0].Key == "balance", string(quota))
 	if len(q.Summary) == 1 {
-		// billing vibe_budget: 150 USD, 5.67% used => ~141.42 USD left for a chat key
-		check("balance is the month's remainder",
-			nearly(q.Summary[0].Value, 150-150*0.05668426738666667) && q.Summary[0].Currency == "USD",
+		// From the 2026-12-01 cycle a harness bills the API half, so a chat key
+		// through this plugin reports the 15 USD API allowance (0.001918% used,
+		// ~14.9997 left), not the 150 USD Vibe month.
+		check("balance is the billing half's remainder",
+			nearly(q.Summary[0].Value, 15-15*0.00001918) && q.Summary[0].Currency == "USD",
 			fmt.Sprint(q.Summary[0]))
 		check("balance marked currency", q.Summary[0].Format == "currency", q.Summary[0].Format)
 	}
 	check("allowance window returned", len(q.Groups) >= 1, string(quota))
+	check("both halves reported", strings.Contains(string(quota), "API \u00b7 Month") && strings.Contains(string(quota), "\"Month\""), string(quota))
 	seen := map[string]float64{}
 	for _, g := range q.Groups {
 		for _, b := range g.Buckets {
@@ -248,6 +251,7 @@ func run(h *handle) bool {
 	check("render status 200", renderedResp.StatusCode == 200, fmt.Sprint(renderedResp.StatusCode))
 	check("render has plan", contains(body, "FREE") || contains(body, "EDU") || contains(body, "Student"), body)
 	check("render has balance", contains(body, "USD") && contains(body, "balance"), body)
+	check("render names the billed half", contains(body, "billing API allowance"), body)
 	check("render has usage bar", contains(body, "used") && (contains(body, "Month")), body)
 
 	var written []byte
@@ -285,6 +289,10 @@ func run(h *handle) bool {
 	check("entry carries the three models",
 		contains(string(written), "mistral-vibe-cli-latest") && contains(string(written), "mistral-vibe-cli-fast"),
 		string(written))
+	// The entry is what CPA forwards with: it has to present as Vibe CLI traffic,
+	// or Mistral books it against the API allowance.
+	check("entry carries the CLI scoping header", contains(string(written), "X-Cli-Scoping"), string(written))
+	check("entry presents as the Vibe CLI", contains(string(written), "vibe-cli"), string(written))
 
 	fmt.Println("[10] balance view")
 	balanceReq, _ := json.Marshal(map[string]any{

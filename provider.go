@@ -176,6 +176,16 @@ func connectProviderAt(ctx context.Context, base, managementKey string, cred cre
 		"api-key-entries": []map[string]string{{"api-key": key}},
 		"models":          models,
 	}
+	// The Vibe CLI presentation travels with the entry, because that is what
+	// asks Mistral to book this traffic as Vibe CLI usage rather than as an
+	// outside tool's.
+	headers := currentConfig().providerHeaders()
+	if err := checkHeaders(headers); err != nil {
+		return connectResult{}, err
+	}
+	if len(headers) > 0 {
+		value["headers"] = headers
+	}
 
 	if index := findProvider(entries, mistralBase); index >= 0 {
 		// Preserve operator-configured fields (priority, prefix, headers, disabled)
@@ -348,7 +358,11 @@ func publishToConfigFile(ctx context.Context, cred credential) {
 	key := firstNonEmpty(cred.APIKey, cred.PlanKey)
 	modelCtx, cancel := context.WithTimeout(ctx, httpTimeout)
 	defer cancel()
-	updated, changed := mergeCompatEntry(string(original), cred.apiBase(), key, listModels(modelCtx, cred.apiBase(), key))
+	headers := currentConfig().providerHeaders()
+	if err := checkHeaders(headers); err != nil {
+		return
+	}
+	updated, changed := mergeCompatEntry(string(original), cred.apiBase(), key, listModels(modelCtx, cred.apiBase(), key), headers)
 	if !changed {
 		return
 	}
@@ -393,13 +407,19 @@ func findConfigFile() string {
 }
 
 // compatEntryYAML renders a single list item under `openai-compatibility:`.
-func compatEntryYAML(base, key string, modelIDs []string) string {
+func compatEntryYAML(base, key string, modelIDs []string, headers map[string]string) string {
 	cleanBase := normalizeAPIBase(base)
 	var b strings.Builder
 	fmt.Fprintf(&b, "  - name: %q\n", providerName)
 	fmt.Fprintf(&b, "    base-url: %q\n", cleanBase+"/v1")
 	b.WriteString("    api-key-entries:\n")
 	fmt.Fprintf(&b, "      - api-key: %q\n", key)
+	if len(headers) > 0 {
+		b.WriteString("    headers:\n")
+		for _, name := range sortedHeaderNames(headers) {
+			fmt.Fprintf(&b, "      %s: %q\n", name, headers[name])
+		}
+	}
 	b.WriteString("    models:\n")
 	for _, id := range modelIDs {
 		fmt.Fprintf(&b, "      - name: %q\n        alias: %q\n", id, id)
@@ -407,9 +427,20 @@ func compatEntryYAML(base, key string, modelIDs []string) string {
 	return b.String()
 }
 
+// sortedHeaderNames keeps the rendered entry stable, so a republish that
+// changes nothing also writes nothing.
+func sortedHeaderNames(headers map[string]string) []string {
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // compatBlock renders the full YAML block for this plugin's provider entry.
-func compatBlock(base, key string, modelIDs []string) string {
-	return "openai-compatibility:\n" + compatEntryYAML(base, key, modelIDs)
+func compatBlock(base, key string, modelIDs []string, headers map[string]string) string {
+	return "openai-compatibility:\n" + compatEntryYAML(base, key, modelIDs, headers)
 }
 
 var (
@@ -422,12 +453,12 @@ var (
 // mergeCompatEntry returns the config with this plugin's provider entry present
 // and carrying the given key, preserving every other `openai-compatibility`
 // provider entry and every other top-level block in the file.
-func mergeCompatEntry(config, base, key string, modelIDs []string) (string, bool) {
+func mergeCompatEntry(config, base, key string, modelIDs []string, headers map[string]string) (string, bool) {
 	if len(modelIDs) == 0 {
 		modelIDs = fallbackModels
 	}
 	cleanBase := normalizeAPIBase(base)
-	wantEntry := strings.TrimRight(compatEntryYAML(cleanBase, key, modelIDs), "\n")
+	wantEntry := strings.TrimRight(compatEntryYAML(cleanBase, key, modelIDs, headers), "\n")
 	wantEntryLines := strings.Split(wantEntry, "\n")
 
 	lines := strings.Split(config, "\n")
@@ -443,9 +474,9 @@ func mergeCompatEntry(config, base, key string, modelIDs []string) (string, bool
 	if start < 0 {
 		trimmed := strings.TrimRight(config, "\n")
 		if trimmed == "" {
-			return compatBlock(cleanBase, key, modelIDs), true
+			return compatBlock(cleanBase, key, modelIDs, headers), true
 		}
-		return trimmed + "\n" + compatBlock(cleanBase, key, modelIDs), true
+		return trimmed + "\n" + compatBlock(cleanBase, key, modelIDs, headers), true
 	}
 
 	// The block runs until the next top-level key.

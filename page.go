@@ -54,6 +54,7 @@ func renderPage(ctx context.Context) []byte {
 		"todayCached": "0", "todayReasoning": "0", "todayCacheRate": "—",
 		"allRequests": "0", "allTotal": "0", "modelRows": "", "usageEmpty": "",
 		"note":    "",
+		"billing": "", "cli": "",
 		"mgmtURL": "/v0/management/" + pluginID + "/",
 		"keyHint": "配置里还没有 key：在 <code>plugins.configs." + configPluginID + "</code> 下填 <code>api_key</code> 后重启 CPA。",
 	}
@@ -76,6 +77,18 @@ func renderPage(ctx context.Context) []byte {
 	view["plan"] = html.EscapeString(firstNonEmpty(plan.Plan, "—"))
 	view["tier"] = html.EscapeString(firstNonEmpty(plan.Tier, "—"))
 	view["planFoot"] = "Mistral Vibe token plan"
+	// Which half of the plan this plugin's traffic spends. From the 2026-12-01
+	// cycle a third-party harness bills the API allowance, so a page that only
+	// named the plan would sit next to a Vibe month the traffic never touches.
+	view["billing"] = scopeLabel(plan.BilledScope)
+	view["cli"] = ambientSummary(plan)
+	if view["billing"] != "" {
+		foot := "计费：Vibe 额度 · Mistral 产品用量"
+		if plan.BilledScope == "api" {
+			foot = "计费：API 额度 · 非 Mistral 产品用量"
+		}
+		view["planFoot"] = html.EscapeString(foot)
+	}
 	if plan.Expires != "" {
 		view["planFoot"] = "有效期至 " + html.EscapeString(shortDate(plan.Expires))
 	}
@@ -154,7 +167,7 @@ func renderRows(plan *planResponse) string {
   <div class="muted">%s</div>
 </div>`,
 			html.EscapeString(firstNonEmpty(plan.Plan, pluginID)),
-			html.EscapeString(firstNonEmpty(plan.Tier, "—")),
+			html.EscapeString(windowTier(plan, w)),
 			html.EscapeString(firstNonEmpty(w.Window, "window")),
 			tone, trimFloat(used*100),
 			trimFloat(used*100), trimFloat(rem*100),
@@ -286,4 +299,32 @@ func cacheRate(t usageTotals) string {
 	}
 	pct := min(100.0, max(0.0, float64(t.Cached)/float64(t.Input)*100))
 	return trimFloat(pct) + "% 命中"
+}
+
+// windowTier labels a row with the half it belongs to, so the API card and the
+// Vibe card are told apart in the table instead of both reading as the tier.
+func windowTier(plan *planResponse, w window) string {
+	tier := firstNonEmpty(plan.Tier, "—")
+	if w.Scope == "" || plan.BilledScope == "" || strings.EqualFold(w.Scope, plan.BilledScope) {
+		return tier
+	}
+	return tier + " · " + w.Scope
+}
+
+// ambientSummary says how this plugin presents itself and whether Mistral
+// agrees about the allowance. It never claims a booking success the billing
+// read does not show.
+func ambientSummary(plan *planResponse) string {
+	note := ambientState()
+	switch {
+	case note.Mode == "":
+		return ""
+	case note.Mode == "vibe_cli" && strings.EqualFold(plan.BilledScope, "vibe"):
+		return "模拟 Vibe CLI 生效 · billing 确认走 Vibe 额度"
+	case note.Mode == "vibe_cli":
+		return "模拟 Vibe CLI 已发出 · billing 仍按 API 额度"
+	case note.Mode == "passthrough":
+		return "未模拟 CLI · 按第三方用量计费"
+	}
+	return ""
 }

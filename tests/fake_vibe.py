@@ -136,7 +136,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/billing/budget":
             return self._send(BILLING_BUDGET)
         if path == "/v1/billing/subscription":
-            return self._send(BILLING_SUBSCRIPTION)
+            body = dict(BILLING_SUBSCRIPTION)
+            # Echo the CLI-impersonation switch back, which is how Mistral's own
+            # scoping answer arrives: present -> the key is scoped to Vibe usage.
+            scoping = (self.headers.get("X-Cli-Scoping") or "").strip()
+            if scoping:
+                body["scoping_cli"] = scoping
+            return self._send(body)
         return self._send({"error": "not found"}, 404)
 
 

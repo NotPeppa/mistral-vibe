@@ -199,6 +199,12 @@
   }
   .usage-metric .accent { color: var(--accent); }
 
+  /* The billed half sits under the amount's label, small enough not to fight
+     the number, because the same balance can come from either allowance. */
+  .sr-note:not(:empty) {
+    display: block; margin-top: 3px; font-size: 10.5px; letter-spacing: .02em;
+    text-transform: none; color: var(--text-3); font-weight: 400;
+  }
   .visually-hidden {
     position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
     overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
@@ -225,11 +231,11 @@
     <div class="card">
       <div class="head"><span>计划</span><span class="pill {{planTone}}">{{tier}}</span></div>
       <div class="value">{{plan}}</div>
-      <div class="foot">{{planFoot}}</div>
+      <div class="foot" title="{{billing}}">{{planFoot}}</div>
     </div>
 
     <div class="card highlight">
-      <div class="head"><span>本月剩余</span></div>
+      <div class="head"><span>本月剩余<span class="sr-note">{{billing}}</span><span class="sr-note">{{cli}}</span></span></div>
       <div class="value">{{remain}}<span class="unit">{{unit}}</span></div>
       <div class="meter{{barTone}}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{barWidth}}" aria-label="本月额度已用">
         <i style="width:{{barWidth}}%"></i>
